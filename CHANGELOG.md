@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.1] — 2026-10-14
+
+### Fixed
+- Fixed global CLI bin symlink path in `package.json` for seamless `npm install -g coc-bridge` installation
+- Dynamic model discovery from `opencode models`
+- Added `coc-bridge models` and `coc-bridge use <model-id>` commands
+- Full daemon backgrounding with `coc-bridge start/stop/status/restart/logs`
+
 ## [1.0.0] — 2026-10-14
 
 ### Added
