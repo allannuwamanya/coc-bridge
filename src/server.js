@@ -281,6 +281,77 @@ function buildPrompt(body) {
 }
 
 /**
+ * Recursively find a file with matching basename inside a directory (max depth 6)
+ */
+function findFileInDir(dir, basename, depth = 0) {
+  if (depth > 6 || !dir || !fs.existsSync(dir)) return null;
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    for (const e of entries) {
+      if (e.name === 'node_modules' || e.name === '.git' || e.name === 'dist' || e.name === 'build' || e.name === '.claude') continue;
+      const full = path.join(dir, e.name);
+      if (e.isFile() && e.name === basename) return full;
+      if (e.isDirectory()) {
+        const sub = findFileInDir(full, basename, depth + 1);
+        if (sub) return sub;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+/**
+ * Detect the user's project directory from headers, system prompt, or message history.
+ */
+function detectProjectDir(body, req) {
+  const hdr = req.headers['x-opencode-directory'] || req.headers['x-project-directory'];
+  if (hdr && fs.existsSync(hdr)) return hdr;
+
+  let sysText = '';
+  if (typeof body.system === 'string') {
+    sysText = body.system;
+  } else if (Array.isArray(body.system)) {
+    sysText = body.system.map(s => (typeof s === 'string' ? s : (s.text || ''))).join('\n');
+  }
+
+  if (sysText) {
+    const m = sysText.match(/(?:current working directory is|working directory is|working directory:|cwd is|cwd:)\s*(\/[A-Za-z0-9_./-]+)/i);
+    if (m) {
+      const p = m[1].replace(/[.,:;)]+$/, '').trim();
+      if (fs.existsSync(p)) return p;
+    }
+    const mTag = sysText.match(/<(?:cwd|working_dir|project_root|project_dir)>([^<]+)<\//i);
+    if (mTag) {
+      const p = mTag[1].replace(/[.,:;)]+$/, '').trim();
+      if (fs.existsSync(p)) return p;
+    }
+  }
+
+  if (Array.isArray(body.messages)) {
+    for (let i = body.messages.length - 1; i >= 0; i--) {
+      const msg = body.messages[i];
+      const str = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+      const matches = str.match(/\/home\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g);
+      if (matches) {
+        for (const candidate of matches) {
+          try {
+            let cur = candidate;
+            while (cur && cur !== '/' && cur !== '/home/alan') {
+              if (fs.existsSync(path.join(cur, 'package.json')) || fs.existsSync(path.join(cur, '.git')) || fs.existsSync(path.join(cur, 'go.mod'))) {
+                return cur;
+              }
+              cur = path.dirname(cur);
+            }
+          } catch (_) {}
+        }
+      }
+    }
+  }
+
+  return process.env.CLAUDE_DIR || process.cwd();
+}
+
+/**
  * Map an OpenCode-native tool name + input to the Claude Code equivalent.
  */
 function mapOpenCodeTool(toolName, input, allowedTools, projectDir) {
@@ -288,42 +359,79 @@ function mapOpenCodeTool(toolName, input, allowedTools, projectDir) {
 
   function cleanPath(p) {
     if (!p) return '';
-    if (p.startsWith(projectDir)) return p.slice(projectDir.length).replace(/^\/+/, '');
-    const SANDBOX_DIR_PATH = require('path').join(require('os').tmpdir(), 'coc-bridge-sandbox');
-    if (p.startsWith(SANDBOX_DIR_PATH)) return p.slice(SANDBOX_DIR_PATH.length).replace(/^\/+/, '');
-    return p;
+    let res = p;
+    if (projectDir && res.startsWith(projectDir)) {
+      res = res.slice(projectDir.length).replace(/^\/+/, '');
+    }
+    const SANDBOX_DIR_PATH = path.join(os.tmpdir(), 'coc-bridge-sandbox');
+    if (res.startsWith(SANDBOX_DIR_PATH)) {
+      res = res.slice(SANDBOX_DIR_PATH.length).replace(/^\/+/, '');
+    }
+    // If relative path already exists in projectDir, use it
+    if (projectDir && fs.existsSync(path.join(projectDir, res))) {
+      return res;
+    }
+    // If res is just a filename/basename, search inside projectDir!
+    if (projectDir) {
+      const base = path.basename(res);
+      const found = findFileInDir(projectDir, base);
+      if (found) {
+        return path.relative(projectDir, found);
+      }
+    }
+    return res;
   }
 
   const find = (...names) =>
     (allowedTools && allowedTools.find(t => names.includes(t.toLowerCase()))) || names[0];
 
   if (norm === 'read' || norm === 'view') {
-    return { name: find('read', 'view'), input: { file_path: cleanPath(input.path || input.file_path || '.') } };
+    const rawPath = input.path || input.file_path || input.filePath || '.';
+    return { name: find('read', 'view'), input: { file_path: cleanPath(rawPath) } };
   }
-  if (norm === 'shell' || norm === 'bash') {
-    return { name: find('bash', 'shell'), input: { command: input.command || input.cmd || '' } };
+  if (norm === 'shell' || norm === 'bash' || norm === 'command') {
+    const cmd = input.command || input.cmd || input.script || '';
+    return { name: find('bash', 'shell'), input: { command: cmd } };
   }
   if (norm === 'glob' || norm === 'list') {
-    return { name: find('glob'), input: { pattern: input.pattern || '*', path: cleanPath(input.path || '.') } };
+    const pattern = input.pattern || input.glob || '*';
+    const rawPath = input.path || input.directory || input.dir || '.';
+    return { name: find('glob'), input: { pattern, path: cleanPath(rawPath) } };
   }
   if (norm === 'grep' || norm === 'search') {
-    return { name: find('grep'), input: { pattern: input.pattern || '', path: cleanPath(input.path || '.') } };
+    const pattern = input.pattern || input.query || input.regex || '';
+    const rawPath = input.path || input.directory || input.dir || '.';
+    return { name: find('grep'), input: { pattern, path: cleanPath(rawPath) } };
   }
   if (norm === 'edit' || norm === 'str_replace') {
+    const rawPath = input.path || input.file_path || input.filePath || '';
+    const oldStr = input.oldString !== undefined ? input.oldString :
+                  (input.old_string !== undefined ? input.old_string :
+                  (input.original !== undefined ? input.original :
+                  (input.oldText !== undefined ? input.oldText : '')));
+    const newStr = input.newString !== undefined ? input.newString :
+                  (input.new_string !== undefined ? input.new_string :
+                  (input.replacement !== undefined ? input.replacement :
+                  (input.newText !== undefined ? input.newText : '')));
+    const replaceAll = input.replaceAll !== undefined ? input.replaceAll :
+                      (input.replace_all !== undefined ? input.replace_all : false);
+
     return {
       name: find('edit', 'str_replace_based_edit_tool'),
       input: {
-        file_path: cleanPath(input.path || input.file_path || ''),
-        old_string: input.old_string || input.original || '',
-        new_string: input.new_string || input.replacement || ''
+        file_path: cleanPath(rawPath),
+        old_string: oldStr,
+        new_string: newStr,
+        replace_all: replaceAll
       }
     };
   }
   if (norm === 'write' || norm === 'create') {
-    return {
-      name: find('write', 'create'),
-      input: { file_path: cleanPath(input.path || input.file_path || ''), content: input.content || '' }
-    };
+    const rawPath = input.path || input.file_path || input.filePath || '';
+    const content = input.content !== undefined ? input.content :
+                   (input.file_text !== undefined ? input.file_text :
+                   (input.text !== undefined ? input.text : ''));
+    return { name: find('write', 'create'), input: { file_path: cleanPath(rawPath), content } };
   }
   if (norm === 'patch' || norm === 'multiedit') {
     return { name: find('multiedit', 'patch'), input };
@@ -350,13 +458,7 @@ function handleMessagesRequest(req, res, reqBody) {
   const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
   // ── Determine working directory ──────────────────────────────────────────────
-  // Claude Code passes an x-opencode-directory header with its project path.
-  // Fall back to the bridge process cwd (user's project when run from terminal).
-  const projectDir =
-    req.headers['x-opencode-directory'] ||
-    req.headers['x-project-directory'] ||
-    process.env.CLAUDE_DIR ||
-    process.cwd();
+  const projectDir = detectProjectDir(body, req);
 
   console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming}, dir=${projectDir})`);
 

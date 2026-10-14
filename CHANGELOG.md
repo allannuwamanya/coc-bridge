@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.4] — 2026-10-15
+
+### Fixed
+- **Edit Tool Parameter Mapping**: Fixed critical bug where OpenCode's camelCase parameters (`oldString`, `newString`, `replaceAll`) resulted in empty string replacements in Claude Code, causing all file edits to fail with "Edit failed".
+- **Dynamic Project Directory Detection**: Automatically extracts the user's active workspace directory from Claude Code's system prompt and message history, preventing OpenCode from running in the bridge's home folder.
+- **Smart Path Resolution**: Recursively searches the workspace for file basenames (e.g. `AntigravityTitleBar.tsx` → `frontend/src/components/layout/AntigravityTitleBar.tsx`) so edits and reads target the exact workspace path.
+- **Eliminated 5-Minute Retry Loops**: Fixed endless tool retry cycles that caused `API Error: Connection lost mid-response` timeouts.
+
 ## [1.0.3] — 2026-10-15
 
 ### Fixed
