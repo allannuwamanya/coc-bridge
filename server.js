@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const PORT = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
 const OPENCODE_BIN = process.env.OPENCODE_BIN || '/home/alan/.nvm/versions/node/v24.21.0/bin/opencode';
 const DEFAULT_MODEL = process.env.OPENCODE_MODEL || 'opencode/space-bunny-free';
+const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB max request size
 
 // List of available OpenCode free models for Claude Code's model discovery (/model)
 const OPENCODE_MODELS = [
@@ -55,7 +56,9 @@ const MODEL_ALIASES = {
 
 function resolveModel(requestedModel) {
   if (!requestedModel) return DEFAULT_MODEL;
-  if (requestedModel.startsWith('opencode/')) return requestedModel;
+
+  // Exact match against known models
+  if (OPENCODE_MODELS.some(m => m.id === requestedModel)) return requestedModel;
   
   const lower = requestedModel.toLowerCase();
   if (MODEL_ALIASES[lower]) return MODEL_ALIASES[lower];
@@ -64,6 +67,7 @@ function resolveModel(requestedModel) {
     if (lower.includes(alias)) return fullId;
   }
   
+  if (requestedModel.startsWith('opencode/')) return requestedModel;
   return DEFAULT_MODEL;
 }
 
@@ -96,8 +100,17 @@ function buildPrompt(body) {
       } else if (Array.isArray(msg.content)) {
         content = msg.content
           .map(part => {
-            if (part.type === 'text') return part.text || '';
-            if (part.type === 'tool_result') return `[Tool Result: ${part.content || ''}]`;
+            if (part.type === 'text') {
+              return part.text || '';
+            }
+            if (part.type === 'tool_use') {
+              const input = typeof part.input === 'object' ? JSON.stringify(part.input) : (part.input || '');
+              return `[Executed Tool: ${part.name}(${input})]`;
+            }
+            if (part.type === 'tool_result') {
+              const resContent = typeof part.content === 'string' ? part.content : JSON.stringify(part.content || '');
+              return `[Tool Result: ${resContent}]`;
+            }
             return '';
           })
           .filter(Boolean)
@@ -139,6 +152,23 @@ function handleMessagesRequest(req, res, reqBody) {
   const child = spawn(OPENCODE_BIN, ['run', '-m', modelName], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env }
+  });
+
+  // Request timeout safety (default 5 minutes)
+  const timeoutMs = parseInt(process.env.BRIDGE_TIMEOUT_MS || '300000', 10);
+  const timer = setTimeout(() => {
+    if (!child.killed) {
+      console.warn(`[Bridge] Request timed out after ${timeoutMs}ms, terminating child process`);
+      child.kill('SIGTERM');
+    }
+  }, timeoutMs);
+
+  // Clean up child process if client disconnects early
+  req.on('close', () => {
+    clearTimeout(timer);
+    if (!child.killed) {
+      child.kill('SIGTERM');
+    }
   });
 
   // Write prompt to stdin and close
@@ -194,6 +224,7 @@ function handleMessagesRequest(req, res, reqBody) {
     });
 
     child.on('close', code => {
+      clearTimeout(timer);
       if (code !== 0 && !accumulatedOutput.trim()) {
         console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
         const errMsg = accumulatedError.trim() || `OpenCode CLI process exited with code ${code}`;
@@ -231,6 +262,7 @@ function handleMessagesRequest(req, res, reqBody) {
     });
 
     child.on('close', code => {
+      clearTimeout(timer);
       if (code !== 0 && !accumulatedOutput.trim()) {
         console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -313,8 +345,21 @@ const server = http.createServer((req, res) => {
   // Handle Anthropic /v1/messages or /api/v1/messages
   if (req.method === 'POST' && (url === '/v1/messages' || url === '/api/v1/messages')) {
     const chunks = [];
-    req.on('data', chunk => chunks.push(chunk));
+    let receivedBytes = 0;
+
+    req.on('data', chunk => {
+      receivedBytes += chunk.length;
+      if (receivedBytes > MAX_PAYLOAD_BYTES) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Payload exceeds 50MB limit' } }));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+
     req.on('end', () => {
+      if (receivedBytes > MAX_PAYLOAD_BYTES) return;
       const rawBody = Buffer.concat(chunks).toString('utf8');
       handleMessagesRequest(req, res, rawBody);
     });
