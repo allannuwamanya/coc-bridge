@@ -26,11 +26,16 @@ const os     = require('os');
 const { spawn, execSync } = require('child_process');
 
 // ─── paths ────────────────────────────────────────────────────────────────────
-const PORT      = parseInt(process.env.BRIDGE_PORT || '4045', 10);
-const LOG_DIR   = path.join(os.homedir(), '.coc-bridge');
-const LOG_FILE  = path.join(LOG_DIR, 'bridge.log');
-const PID_FILE  = path.join(LOG_DIR, 'bridge.pid');
-const SERVER_JS = path.join(__dirname, '..', 'src', 'server.js');
+const PORT        = parseInt(process.env.BRIDGE_PORT || '4045', 10);
+const LOG_DIR     = path.join(os.homedir(), '.coc-bridge');
+const LOG_FILE    = path.join(LOG_DIR, 'bridge.log');
+const PID_FILE    = path.join(LOG_DIR, 'bridge.pid');
+const CONFIG_FILE = path.join(LOG_DIR, 'config.json');
+const SERVER_JS   = path.join(__dirname, '..', 'src', 'server.js');
+
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (_) { return {}; }
+}
 
 // ─── colours ──────────────────────────────────────────────────────────────────
 const G = '\x1b[32m', Y = '\x1b[33m', R = '\x1b[31m', B = '\x1b[34m';
@@ -202,6 +207,84 @@ function cmdServer() {
   require(SERVER_JS);
 }
 
+// ── coc-bridge models ──────────────────────────────────────────────────────────
+function cmdModels() {
+  const { spawnSync } = require('child_process');
+  const NODE = process.execPath;
+
+  // Ask the bridge's own health endpoint first (if running)
+  http.get(`http://127.0.0.1:${PORT}/v1/models`, { timeout: 2000 }, res => {
+    let body = '';
+    res.on('data', d => body += d);
+    res.on('end', () => {
+      try {
+        const data = JSON.parse(body);
+        printModelList(data.data, '(from running bridge)');
+      } catch (_) {
+        fetchAndPrint();
+      }
+    });
+  }).on('error', () => fetchAndPrint());
+
+  function fetchAndPrint() {
+    // Bridge not running — call opencode models directly
+    let opencodebin;
+    try {
+      const { execSync } = require('child_process');
+      opencodebin = execSync('which opencode', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    } catch (_) {
+      const candidates = [
+        path.join(os.homedir(), '.nvm', 'versions', 'node', 'v24.21.0', 'bin', 'opencode'),
+        path.join(os.homedir(), '.local', 'bin', 'opencode'),
+        '/usr/local/bin/opencode',
+      ];
+      opencodebin = candidates.find(c => { try { fs.accessSync(c, fs.constants.X_OK); return true; } catch (_) { return false; } });
+    }
+    if (!opencodebin) {
+      console.log(`\n${R}  Cannot find opencode. Install it: npm install -g opencode${RESET}\n`);
+      return;
+    }
+    const r = spawnSync(opencodebin, ['models'], { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'] });
+    if (r.status !== 0 || !r.stdout) {
+      console.log(`\n${R}  opencode models failed.${RESET}\n`);
+      return;
+    }
+    const models = r.stdout.trim().split('\n').filter(Boolean).map(id => ({ id, display_name: id }));
+    printModelList(models, '(from opencode)');
+  }
+
+  function printModelList(models, source) {
+    const cfg = readConfig();
+    const current = cfg.defaultModel || 'opencode/space-bunny-free';
+    console.log(`\n${BOLD}  Available OpenCode models ${DIM}${source}${RESET}\n`);
+    for (const m of models) {
+      const isDefault = m.id === current;
+      const tag = isDefault ? ` ${G}← current default${RESET}` : '';
+      console.log(`  ${isDefault ? G + BOLD : DIM}${m.id}${RESET}${tag}`);
+    }
+    console.log(`\n  ${DIM}Set default: ${RESET}${BOLD}coc-bridge use <model-id>${RESET}\n`);
+  }
+}
+
+// ── coc-bridge use <model> ─────────────────────────────────────────────────────
+function cmdUse(modelId) {
+  if (!modelId) {
+    console.log(`\n${R}  Usage: coc-bridge use <model-id>${RESET}`);
+    console.log(`  Example: coc-bridge use opencode/cat-jam-free\n`);
+    console.log(`  Run ${BOLD}coc-bridge models${RESET} to see what's available.\n`);
+    return;
+  }
+  ensureLogDir();
+  const cfg = readConfig();
+  const previous = cfg.defaultModel || 'opencode/space-bunny-free';
+  cfg.defaultModel = modelId;
+  fs.writeFileSync(CONFIG_FILE, JSON.stringify(cfg, null, 2));
+  console.log(`\n${G}${BOLD}  ✔  Default model updated${RESET}`);
+  console.log(`     ${DIM}Was:${RESET} ${previous}`);
+  console.log(`     ${DIM}Now:${RESET} ${G}${modelId}${RESET}`);
+  console.log(`\n  ${DIM}Restart the bridge to apply: ${RESET}${BOLD}coc-bridge restart${RESET}\n`);
+}
+
 function showHelp() {
   const pkg = require('../package.json');
   console.log(`
@@ -213,39 +296,33 @@ ${BOLD}USAGE${RESET}
   coc-bridge [command]
 
 ${BOLD}COMMANDS${RESET}
-  ${G}(default)${RESET}    Start the bridge in the background, then return your prompt
+  ${G}(default)${RESET}    Start the bridge in the background, return your prompt
   ${G}stop${RESET}         Stop the running background bridge
   ${G}restart${RESET}      Stop then start again
   ${G}status${RESET}       Show whether the bridge is running
   ${G}logs${RESET}         Tail the live log file
+  ${G}models${RESET}       List all available OpenCode models
+  ${G}use <id>${RESET}     Set the default model (saved to ~/.coc-bridge/config.json)
   ${G}server${RESET}       Run in the foreground (useful for debugging)
   ${G}setup${RESET}        Wire Claude Code to auto-start the bridge on login
   ${G}doctor${RESET}       Check that Node, opencode, and claude are all wired up
 
 ${BOLD}ENVIRONMENT VARIABLES${RESET}
   BRIDGE_PORT        Port to listen on          (default: 4045)
-  OPENCODE_MODEL     Default OpenCode model     (default: opencode/space-bunny-free)
+  OPENCODE_MODEL     Default model              (overrides config.json)
   OPENCODE_BIN       Path to opencode binary    (auto-detected)
   BRIDGE_TIMEOUT_MS  Max ms per request         (default: 300000)
 
-${BOLD}AVAILABLE MODELS${RESET}
-  opencode/space-bunny-free
-  opencode/cat-jam-free
-  opencode/muse-spark-1.3-contributor-free
-  opencode/nemotron-3-ultra-free
-  opencode/nemotron-3.5-lightning-free
-  opencode/ling-3.1-flash-free
-  opencode/longcat-2.5-preview-free
-  opencode/mimo-v2.6-flash-free
-  opencode/big-pickle
-
 ${BOLD}EXAMPLES${RESET}
-  coc-bridge                   # Start daemon, get prompt back
-  coc-bridge stop              # Shut it down
-  coc-bridge status            # Is it running?
-  coc-bridge logs              # Watch live logs
-  coc-bridge setup             # One-time Claude Code wiring
-  BRIDGE_PORT=5000 coc-bridge  # Custom port
+  coc-bridge                             # Start daemon, get prompt back
+  coc-bridge models                      # See all models you can use
+  coc-bridge use opencode/cat-jam-free   # Switch default model
+  coc-bridge restart                     # Apply model change
+  coc-bridge stop                        # Shut it down
+  coc-bridge status                      # Is it running?
+  coc-bridge logs                        # Watch live logs
+  coc-bridge setup                       # One-time Claude Code wiring
+  BRIDGE_PORT=5000 coc-bridge            # Custom port
 `);
 }
 
@@ -254,12 +331,14 @@ const cmd = process.argv[2] || 'start';
 
 (async () => {
   switch (cmd) {
-    case 'start':     await cmdStart();   break;
-    case 'stop':      await cmdStop();    break;
-    case 'status':    await cmdStatus();  break;
-    case 'restart':   await cmdRestart(); break;
-    case 'logs':      cmdLogs();          break;
-    case 'server':    cmdServer();        break;
+    case 'start':     await cmdStart();              break;
+    case 'stop':      await cmdStop();               break;
+    case 'status':    await cmdStatus();             break;
+    case 'restart':   await cmdRestart();            break;
+    case 'logs':      cmdLogs();                     break;
+    case 'server':    cmdServer();                   break;
+    case 'models':    cmdModels();                   break;
+    case 'use':       cmdUse(process.argv[3]);       break;
     case 'setup':     require(path.join(__dirname, '..', 'scripts', 'setup-claude.js')); break;
     case 'doctor':    require(path.join(__dirname, '..', 'scripts', 'doctor.js'));       break;
     case '--version':
@@ -278,3 +357,4 @@ const cmd = process.argv[2] || 'start';
       process.exit(1);
   }
 })();
+

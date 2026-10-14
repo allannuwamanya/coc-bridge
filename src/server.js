@@ -1,15 +1,24 @@
 #!/usr/bin/env node
-const http = require('http');
-const { spawn, execSync } = require('child_process');
+const http   = require('http');
+const { spawn, execSync, spawnSync } = require('child_process');
 const crypto = require('crypto');
-const path = require('path');
-const os = require('os');
+const path   = require('path');
+const os     = require('os');
+const fs     = require('fs');
 
-const PORT = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
-const DEFAULT_MODEL = process.env.OPENCODE_MODEL || 'opencode/space-bunny-free';
-const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB max request size
+const PORT             = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
+const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB
+const CONFIG_FILE      = path.join(os.homedir(), '.coc-bridge', 'config.json');
 
-// Resolve opencode binary: env override → PATH → common NVM locations
+// ─── Config (persists user's chosen default model) ────────────────────────────
+function readConfig() {
+  try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (_) { return {}; }
+}
+
+const config       = readConfig();
+const DEFAULT_MODEL = process.env.OPENCODE_MODEL || config.defaultModel || 'opencode/space-bunny-free';
+
+// ─── Find opencode binary ─────────────────────────────────────────────────────
 function findOpencodeBin() {
   if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN;
   try { return execSync('which opencode', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch (_) {}
@@ -21,76 +30,100 @@ function findOpencodeBin() {
     '/usr/bin/opencode',
   ];
   for (const c of candidates) {
-    try { require('fs').accessSync(c, require('fs').constants.X_OK); return c; } catch (_) {}
+    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch (_) {}
   }
-  console.error('[coc-bridge] ❌  Cannot find opencode binary. Install it first:\n  npm install -g opencode\nor set OPENCODE_BIN=/path/to/opencode');
+  console.error('[coc-bridge] ❌  Cannot find opencode binary.\n  Install it: npm install -g opencode\n  Or set: OPENCODE_BIN=/path/to/opencode');
   process.exit(1);
 }
 const OPENCODE_BIN = findOpencodeBin();
 
-
-// List of available OpenCode free models for Claude Code's model discovery (/model)
-const OPENCODE_MODELS = [
-  { id: 'opencode/space-bunny-free', display_name: 'Space Bunny (Free - Default)' },
-  { id: 'opencode/cat-jam-free', display_name: 'Cat Jam (Free)' },
-  { id: 'opencode/muse-spark-1.3-contributor-free', display_name: 'Muse Spark 1.3 (Free - Meta Reasoning)' },
-  { id: 'opencode/nemotron-3-ultra-free', display_name: 'NVIDIA Nemotron 3 Ultra (Free)' },
-  { id: 'opencode/nemotron-3.5-lightning-free', display_name: 'NVIDIA Nemotron 3.5 Lightning (Free)' },
-  { id: 'opencode/ling-3.1-flash-free', display_name: 'Ling 3.1 Flash (Free)' },
-  { id: 'opencode/longcat-2.5-preview-free', display_name: 'Longcat 2.5 Preview (Free)' },
-  { id: 'opencode/mimo-v2.6-flash-free', display_name: 'Mimo 2.6 Flash (Free)' },
-  { id: 'opencode/big-pickle', display_name: 'Big Pickle (Free)' }
-];
-
-// Map shortcuts, aliases, and standard Anthropic menu names to OpenCode models
-const MODEL_ALIASES = {
-  // OpenCode aliases
-  'space-bunny': 'opencode/space-bunny-free',
-  'space-bunny-free': 'opencode/space-bunny-free',
-  'cat-jam': 'opencode/cat-jam-free',
-  'cat-jam-free': 'opencode/cat-jam-free',
-  'muse-spark': 'opencode/muse-spark-1.3-contributor-free',
-  'muse-spark-1.3': 'opencode/muse-spark-1.3-contributor-free',
-  'nemotron': 'opencode/nemotron-3-ultra-free',
-  'nemotron-ultra': 'opencode/nemotron-3-ultra-free',
-  'nemotron-lightning': 'opencode/nemotron-3.5-lightning-free',
-  'ling-flash': 'opencode/ling-3.1-flash-free',
-  'longcat': 'opencode/longcat-2.5-preview-free',
-  'mimo': 'opencode/mimo-v2.6-flash-free',
-  'big-pickle': 'opencode/big-pickle',
-
-  // Standard VS Code dropdown menu selections mapped to best OpenCode models
-  'opus': 'opencode/nemotron-3-ultra-free',
-  'claude-3-opus': 'opencode/nemotron-3-ultra-free',
-  'claude-opus-5': 'opencode/nemotron-3-ultra-free',
-  'claude-opus-5-5': 'opencode/nemotron-3-ultra-free',
-  'sonnet': 'opencode/muse-spark-1.3-contributor-free',
-  'claude-3-5-sonnet': 'opencode/muse-spark-1.3-contributor-free',
-  'claude-sonnet-5-5': 'opencode/muse-spark-1.3-contributor-free',
-  'haiku': 'opencode/cat-jam-free',
-  'claude-3-5-haiku': 'opencode/cat-jam-free',
-  'claude-haiku-5-5': 'opencode/cat-jam-free',
-  'fable': 'opencode/ling-3.1-flash-free',
-  'claude-3-5-fable': 'opencode/ling-3.1-flash-free',
-  'claude-fable-5-1': 'opencode/ling-3.1-flash-free'
-};
-
-function resolveModel(requestedModel) {
-  if (!requestedModel) return DEFAULT_MODEL;
-
-  // Exact match against known models
-  if (OPENCODE_MODELS.some(m => m.id === requestedModel)) return requestedModel;
-  
-  const lower = requestedModel.toLowerCase();
-  if (MODEL_ALIASES[lower]) return MODEL_ALIASES[lower];
-
-  for (const [alias, fullId] of Object.entries(MODEL_ALIASES)) {
-    if (lower.includes(alias)) return fullId;
+// ─── Dynamic model discovery ──────────────────────────────────────────────────
+// Calls `opencode models` to get whatever models the user's opencode instance
+// actually has access to — free, paid, or custom providers.
+function fetchAvailableModels() {
+  try {
+    const result = spawnSync(OPENCODE_BIN, ['models'], {
+      encoding: 'utf8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (result.status !== 0 || !result.stdout) return null;
+    const ids = result.stdout
+      .split('\n')
+      .map(l => l.trim())
+      .filter(Boolean);
+    return ids.map(id => ({
+      id,
+      display_name: formatModelName(id),
+    }));
+  } catch (_) {
+    return null;
   }
-  
-  if (requestedModel.startsWith('opencode/')) return requestedModel;
+}
+
+// Make a readable name from the model id, e.g. "opencode/cat-jam-free" → "Cat Jam (Free)"
+function formatModelName(id) {
+  const slug = id.replace(/^[^/]+\//, ''); // strip provider prefix
+  return slug
+    .replace(/-free$/, ' (Free)')
+    .replace(/-preview$/, ' (Preview)')
+    .replace(/-contributor-free$/, ' (Free)')
+    .replace(/-/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase())
+    .replace(/\(free\)/i, '(Free)')
+    .replace(/\(preview\)/i, '(Preview)')
+    .trim();
+}
+
+// Fetch at startup; fall back to a minimal list if opencode models fails
+let OPENCODE_MODELS = fetchAvailableModels() || [
+  { id: 'opencode/space-bunny-free', display_name: 'Space Bunny (Free)' },
+];
+console.log(`[coc-bridge] Loaded ${OPENCODE_MODELS.length} model(s) from opencode`);
+
+// Refresh model list periodically (every 10 min) without restarting the server
+setInterval(() => {
+  const fresh = fetchAvailableModels();
+  if (fresh && fresh.length > 0) {
+    OPENCODE_MODELS = fresh;
+    console.log(`[coc-bridge] Refreshed model list: ${OPENCODE_MODELS.length} model(s)`);
+  }
+}, 10 * 60 * 1000);
+
+// ─── Model resolution ─────────────────────────────────────────────────────────
+// Resolves whatever Claude Code sends (full id, short name, or Claude tier name)
+// to the actual opencode model string.
+function resolveModel(requested) {
+  if (!requested) return DEFAULT_MODEL;
+
+  // Exact match in the live model list
+  if (OPENCODE_MODELS.some(m => m.id === requested)) return requested;
+
+  // Any opencode/ prefixed id is passed through directly (user might have
+  // models not yet in the cached list, e.g. just added a provider)
+  if (requested.startsWith('opencode/') || requested.includes('/')) return requested;
+
+  const lower = requested.toLowerCase();
+
+  // Substring fuzzy match against known model ids
+  const fuzzy = OPENCODE_MODELS.find(m => m.id.toLowerCase().includes(lower));
+  if (fuzzy) return fuzzy.id;
+
+  // Claude Code tier names → sensible defaults (user can override with config)
+  const tierMap = config.tierMap || {};
+  const builtinTierMap = {
+    'opus':   config.opusModel   || OPENCODE_MODELS.find(m => m.id.includes('nemotron') && m.id.includes('ultra'))?.id || DEFAULT_MODEL,
+    'sonnet': config.sonnetModel || OPENCODE_MODELS.find(m => m.id.includes('muse') || m.id.includes('spark'))?.id     || DEFAULT_MODEL,
+    'haiku':  config.haikuModel  || OPENCODE_MODELS.find(m => m.id.includes('cat') || m.id.includes('jam'))?.id        || DEFAULT_MODEL,
+    'fable':  config.fableModel  || OPENCODE_MODELS.find(m => m.id.includes('ling') || m.id.includes('flash'))?.id     || DEFAULT_MODEL,
+  };
+  for (const [tier, target] of Object.entries({ ...builtinTierMap, ...tierMap })) {
+    if (lower.includes(tier)) return target;
+  }
+
   return DEFAULT_MODEL;
 }
+
 
 /**
  * Convert Anthropic message format into a clean prompt string for OpenCode CLI
