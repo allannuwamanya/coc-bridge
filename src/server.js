@@ -226,29 +226,11 @@ function buildPrompt(body) {
   let promptParts = [];
   const allowedTools = [];
 
-  // 1. Tool schemas and instructions
+  // 1. Tool names allowed
   if (Array.isArray(body.tools) && body.tools.length > 0) {
-    let toolsDesc = '## Available Tools & Instructions\n';
-    toolsDesc += 'You are acting as the AI model for Claude Code. You do NOT have any built-in tools or direct filesystem access.\n';
-    toolsDesc += 'Do NOT attempt to use any internal OpenCode tools (like read, glob, shell, or edit).\n';
-    toolsDesc += 'Instead, to view files, make edits, run terminal commands, or list directories, you MUST emit a tool call in this exact JSON block:\n\n';
-    toolsDesc += '```tool_call\n';
-    toolsDesc += '{"name": "<ToolName>", "input": { ...arguments according to input schema... }}\n';
-    toolsDesc += '```\n\n';
-    toolsDesc += 'Claude Code will execute the tool on the user\'s local machine and return the result to you in the next message.\n';
-    toolsDesc += 'When you have enough information to answer the user without tools, reply with your normal explanation and NO tool_call blocks.\n\n';
-    toolsDesc += 'Tools available to request:\n';
-
     for (const tool of body.tools) {
-      if (tool && tool.name) {
-        allowedTools.push(tool.name);
-        toolsDesc += `\n### Tool: ${tool.name}\n`;
-        if (tool.description) toolsDesc += `Description: ${tool.description}\n`;
-        if (tool.input_schema) toolsDesc += `Input Schema: ${JSON.stringify(tool.input_schema)}\n`;
-      }
+      if (tool && tool.name) allowedTools.push(tool.name);
     }
-
-    promptParts.push(`[System Instructions & Tools]\n${toolsDesc}\n`);
   }
 
   // 2. Add system prompt from Claude Code
@@ -299,6 +281,57 @@ function buildPrompt(body) {
 }
 
 /**
+ * Map an OpenCode-native tool name + input to the Claude Code equivalent.
+ */
+function mapOpenCodeTool(toolName, input, allowedTools, projectDir) {
+  const norm = (toolName || '').toLowerCase();
+
+  function cleanPath(p) {
+    if (!p) return '';
+    if (p.startsWith(projectDir)) return p.slice(projectDir.length).replace(/^\/+/, '');
+    const SANDBOX_DIR_PATH = require('path').join(require('os').tmpdir(), 'coc-bridge-sandbox');
+    if (p.startsWith(SANDBOX_DIR_PATH)) return p.slice(SANDBOX_DIR_PATH.length).replace(/^\/+/, '');
+    return p;
+  }
+
+  const find = (...names) =>
+    (allowedTools && allowedTools.find(t => names.includes(t.toLowerCase()))) || names[0];
+
+  if (norm === 'read' || norm === 'view') {
+    return { name: find('read', 'view'), input: { file_path: cleanPath(input.path || input.file_path || '.') } };
+  }
+  if (norm === 'shell' || norm === 'bash') {
+    return { name: find('bash', 'shell'), input: { command: input.command || input.cmd || '' } };
+  }
+  if (norm === 'glob' || norm === 'list') {
+    return { name: find('glob'), input: { pattern: input.pattern || '*', path: cleanPath(input.path || '.') } };
+  }
+  if (norm === 'grep' || norm === 'search') {
+    return { name: find('grep'), input: { pattern: input.pattern || '', path: cleanPath(input.path || '.') } };
+  }
+  if (norm === 'edit' || norm === 'str_replace') {
+    return {
+      name: find('edit', 'str_replace_based_edit_tool'),
+      input: {
+        file_path: cleanPath(input.path || input.file_path || ''),
+        old_string: input.old_string || input.original || '',
+        new_string: input.new_string || input.replacement || ''
+      }
+    };
+  }
+  if (norm === 'write' || norm === 'create') {
+    return {
+      name: find('write', 'create'),
+      input: { file_path: cleanPath(input.path || input.file_path || ''), content: input.content || '' }
+    };
+  }
+  if (norm === 'patch' || norm === 'multiedit') {
+    return { name: find('multiedit', 'patch'), input };
+  }
+  return { name: toolName, input };
+}
+
+/**
  * Handle POST /v1/messages (Anthropic API compatible)
  */
 function handleMessagesRequest(req, res, reqBody) {
@@ -316,13 +349,30 @@ function handleMessagesRequest(req, res, reqBody) {
   const isStreaming = Boolean(body.stream);
   const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
-  console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming})`);
+  // ── Determine working directory ──────────────────────────────────────────────
+  // Claude Code passes an x-opencode-directory header with its project path.
+  // Fall back to the bridge process cwd (user's project when run from terminal).
+  const projectDir =
+    req.headers['x-opencode-directory'] ||
+    req.headers['x-project-directory'] ||
+    process.env.CLAUDE_DIR ||
+    process.cwd();
 
-  // Run in empty sandbox dir so OpenCode cannot touch user files directly
-  const child = spawn(OPENCODE_BIN, ['run', '-m', modelName, '--format', 'json'], {
-    cwd: SANDBOX_DIR,
+  console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming}, dir=${projectDir})`);
+
+  // ── Spawn opencode ────────────────────────────────────────────────────────────
+  // --standalone: own private server, no port conflict with background opencode.
+  const childArgs = ['run', '-m', modelName, '--format', 'json'];
+  // Note: --standalone may not be supported by all opencode versions; try without if it fails
+  const binDir = path.dirname(OPENCODE_BIN);
+  const childEnv = {
+    ...process.env,
+    PATH: binDir + (process.env.PATH ? path.delimiter + process.env.PATH : '')
+  };
+  const child = spawn(OPENCODE_BIN, childArgs, {
+    cwd: projectDir,
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env }
+    env: childEnv
   });
 
   // Request timeout safety (default 5 minutes)
@@ -334,39 +384,157 @@ function handleMessagesRequest(req, res, reqBody) {
     }
   }, timeoutMs);
 
-  // Clean up child process if client disconnects early
-  res.on('close', () => {
-    clearTimeout(timer);
-    if (!res.writableEnded && !child.killed) {
-      console.warn(`[Bridge] Client connection closed prematurely, terminating child process`);
-      child.kill('SIGTERM');
+  // ── SSE state ─────────────────────────────────────────────────────────────────
+  let sseStarted = false;
+  let blockIndex = 0;
+  let textBlockIndex = -1;
+  let inputTokens = Math.ceil(prompt.length / 4);
+  let outputTokens = 0;
+  let accumulatedText = '';
+  let reportedTokens = null;
+  let clientClosed = false;
+  let nativeToolsEmitted = 0; // count of tool_use events from OpenCode
+
+  function startSSE() {
+    if (sseStarted || !isStreaming) return;
+    sseStarted = true;
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
+    });
+    res.write(`event: message_start\ndata: ${JSON.stringify({
+      type: 'message_start',
+      message: {
+        id: messageId,
+        type: 'message',
+        role: 'assistant',
+        model: modelName,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 1 }
+      }
+    })}\n\n`);
+  }
+
+  function sseWrite(event, data) {
+    if (clientClosed) return;
+    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
+  }
+
+  function emitToolUse(toolName, toolInput) {
+    if (!isStreaming) return;
+    startSSE();
+    const mapped = mapOpenCodeTool(toolName, toolInput || {}, allowedTools, projectDir);
+
+    // Only emit if the tool is in Claude Code's allowed list
+    const lcAllowed = allowedTools.map(t => t.toLowerCase());
+    if (allowedTools.length > 0 && !lcAllowed.includes(mapped.name.toLowerCase())) {
+      console.log(`[Bridge] Skipping tool not in allowed list: ${toolName} → ${mapped.name}`);
+      return;
     }
+
+    const toolUseId = `toolu_${crypto.randomBytes(12).toString('hex')}`;
+    console.log(`[Bridge] ToolUse emit: ${toolName} → ${mapped.name}`);
+    nativeToolsEmitted++;
+
+    sseWrite('content_block_start', {
+      type: 'content_block_start', index: blockIndex,
+      content_block: { type: 'tool_use', id: toolUseId, name: mapped.name, input: {} }
+    });
+    sseWrite('content_block_delta', {
+      type: 'content_block_delta', index: blockIndex,
+      delta: { type: 'input_json_delta', partial_json: JSON.stringify(mapped.input) }
+    });
+    sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    blockIndex++;
+  }
+
+  function emitText(text) {
+    if (!text || !text.trim() || !isStreaming) return;
+    startSSE();
+    sseWrite('content_block_start', {
+      type: 'content_block_start', index: blockIndex,
+      content_block: { type: 'text', text: '' }
+    });
+    sseWrite('content_block_delta', {
+      type: 'content_block_delta', index: blockIndex,
+      delta: { type: 'text_delta', text: text }
+    });
+    sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+    blockIndex++;
+  }
+
+  // ── Clean up if client disconnects ───────────────────────────────────────────
+  res.on('close', () => {
+    clientClosed = true;
+    clearTimeout(timer);
+    if (!child.killed) child.kill('SIGTERM');
   });
 
   child.stdin.write(prompt);
   child.stdin.end();
 
   let stdoutBuffer = '';
-  let accumulatedText = '';
   let accumulatedError = '';
-  let reportedTokens = null;
+  const pendingTools = new Map(); // toolId → { toolName, input }
 
   child.stdout.on('data', chunk => {
     stdoutBuffer += chunk.toString();
     const lines = stdoutBuffer.split('\n');
-    stdoutBuffer = lines.pop(); // keep partial line
+    stdoutBuffer = lines.pop();
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      try {
-        const ev = JSON.parse(line);
-        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
-          accumulatedText += ev.part.text;
-        } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
-          reportedTokens = ev.part.tokens;
+      let ev;
+      try { ev = JSON.parse(line); } catch (_) { continue; }
+
+      // ── OpenCode native tool events ──────────────────────────────────────
+      if (ev.type === 'tool_use' && ev.part) {
+        const part      = ev.part;
+        const toolName  = part.tool || part.name || '';
+        const toolState = part.state || {};
+        const toolId    = part.id || part.tool_use_id || `${toolName}_${Date.now()}`;
+
+        const status = toolState.status || '';
+        if (status === 'running' || status === 'pending') {
+          // Tool started — remember, emit on completion (so we have full input)
+          pendingTools.set(toolId, { toolName, input: toolState.input || {} });
+        } else if (status === 'completed' || status === 'error') {
+          const input = toolState.input || (pendingTools.get(toolId) || {}).input || {};
+          pendingTools.delete(toolId);
+          emitToolUse(toolName, input);
+        } else {
+          // No explicit status — emit immediately
+          emitToolUse(toolName, toolState.input || {});
         }
-      } catch (_) {
-        accumulatedText += line + '\n';
+      }
+
+      // ── Model text ───────────────────────────────────────────────────────
+      if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+        accumulatedText += ev.part.text;
+        if (isStreaming && allowedTools.length === 0) {
+          if (!sseStarted) startSSE();
+          if (textBlockIndex === -1) {
+            textBlockIndex = blockIndex++;
+            sseWrite('content_block_start', {
+              type: 'content_block_start',
+              index: textBlockIndex,
+              content_block: { type: 'text', text: '' }
+            });
+          }
+          sseWrite('content_block_delta', {
+            type: 'content_block_delta',
+            index: textBlockIndex,
+            delta: { type: 'text_delta', text: ev.part.text }
+          });
+        }
+      }
+
+      // ── Token counts ─────────────────────────────────────────────────────
+      if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
+        reportedTokens = ev.part.tokens;
       }
     }
   });
@@ -377,8 +545,9 @@ function handleMessagesRequest(req, res, reqBody) {
 
   child.on('close', code => {
     clearTimeout(timer);
+    if (clientClosed) return;
 
-    // Process any remaining buffered stdout
+    // Flush any remaining buffered line
     if (stdoutBuffer.trim()) {
       try {
         const ev = JSON.parse(stdoutBuffer);
@@ -386,17 +555,20 @@ function handleMessagesRequest(req, res, reqBody) {
           accumulatedText += ev.part.text;
         } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
           reportedTokens = ev.part.tokens;
+        } else if (ev.type === 'tool_use' && ev.part) {
+          const part = ev.part;
+          const toolState = part.state || {};
+          emitToolUse(part.tool || '', toolState.input || {});
         }
-      } catch (_) {
-        accumulatedText += stdoutBuffer;
-      }
+      } catch (_) {}
     }
 
-    if (code !== 0 && !accumulatedText.trim()) {
+    // Error: process failed, nothing useful
+    if (code !== 0 && !accumulatedText.trim() && nativeToolsEmitted === 0) {
       console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
       const errMsg = accumulatedError.trim() || `OpenCode process exited with code ${code}`;
       if (isStreaming) {
-        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        if (!sseStarted) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
         res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: errMsg } })}\n\n`);
         res.end();
       } else {
@@ -407,112 +579,52 @@ function handleMessagesRequest(req, res, reqBody) {
     }
 
     // Token accounting
-    const inputTokens = (reportedTokens && reportedTokens.input) || Math.ceil(prompt.length / 4);
-    const outputTokens = (reportedTokens && reportedTokens.output)
+    inputTokens  = (reportedTokens && reportedTokens.input)  || Math.ceil(prompt.length / 4);
+    outputTokens = (reportedTokens && reportedTokens.output)
       ? (reportedTokens.output + (reportedTokens.reasoning || 0))
       : Math.ceil(accumulatedText.length / 4);
 
-    // Extract tool calls
-    const { text: cleanText, toolCalls } = extractToolCalls(accumulatedText, allowedTools);
-    const hasToolCalls = toolCalls.length > 0;
-    const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
-
     if (isStreaming) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive'
-      });
-
-      // 1. message_start
-      res.write(`event: message_start\ndata: ${JSON.stringify({
-        type: 'message_start',
-        message: {
-          id: messageId,
-          type: 'message',
-          role: 'assistant',
-          model: modelName,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: inputTokens, output_tokens: 1 }
+      let hasToolCalls = false;
+      // If no native tool events came from OpenCode, try text-based tool_call fallback
+      if (nativeToolsEmitted === 0) {
+        const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
+        if (textToolCalls.length > 0) {
+          hasToolCalls = true;
+          if (cleanText.length > 0) emitText(cleanText);
+          for (const tc of textToolCalls) emitToolUse(tc.name, tc.input);
+        } else {
+          // If text wasn't already streamed in real-time, emit it now
+          if (textBlockIndex === -1) {
+            emitText(accumulatedText);
+          } else {
+            sseWrite('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+          }
         }
-      })}\n\n`);
-
-      let blockIndex = 0;
-
-      // 2. Text block (if clean text exists)
-      if (cleanText.length > 0) {
-        res.write(`event: content_block_start\ndata: ${JSON.stringify({
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: { type: 'text', text: '' }
-        })}\n\n`);
-
-        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: { type: 'text_delta', text: cleanText }
-        })}\n\n`);
-
-        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-          type: 'content_block_stop',
-          index: blockIndex
-        })}\n\n`);
-
-        blockIndex++;
+      } else {
+        hasToolCalls = true;
+        // Native tool_use blocks were already emitted during the stream.
+        // We do not emit trailing text here because stop_reason is 'tool_use'
+        // and Claude Code will execute the tool and request the final answer in Turn 2.
       }
 
-      // 3. Tool use blocks
-      for (const tc of toolCalls) {
-        const toolUseId = `toolu_${crypto.randomBytes(12).toString('hex')}`;
+      if (!sseStarted) startSSE();
 
-        res.write(`event: content_block_start\ndata: ${JSON.stringify({
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: {
-            type: 'tool_use',
-            id: toolUseId,
-            name: tc.name,
-            input: {}
-          }
-        })}\n\n`);
-
-        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: {
-            type: 'input_json_delta',
-            partial_json: JSON.stringify(tc.input)
-          }
-        })}\n\n`);
-
-        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-          type: 'content_block_stop',
-          index: blockIndex
-        })}\n\n`);
-
-        blockIndex++;
-      }
-
-      // 4. message_delta
-      res.write(`event: message_delta\ndata: ${JSON.stringify({
+      const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
+      sseWrite('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
         usage: { output_tokens: outputTokens }
-      })}\n\n`);
-
-      // 5. message_stop
-      res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
+      });
+      sseWrite('message_stop', { type: 'message_stop' });
       res.end();
 
     } else {
       // Non-streaming response
+      const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
       const content = [];
-      if (cleanText.length > 0) {
-        content.push({ type: 'text', text: cleanText });
-      }
-      for (const tc of toolCalls) {
+      if (cleanText.length > 0) content.push({ type: 'text', text: cleanText });
+      for (const tc of textToolCalls) {
         content.push({
           type: 'tool_use',
           id: `toolu_${crypto.randomBytes(12).toString('hex')}`,
@@ -520,30 +632,18 @@ function handleMessagesRequest(req, res, reqBody) {
           input: tc.input
         });
       }
-      if (content.length === 0) {
-        content.push({ type: 'text', text: accumulatedText.trim() });
-      }
-
-      const responsePayload = {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        model: modelName,
-        content,
-        stop_reason: stopReason,
-        stop_sequence: null,
-        usage: {
-          input_tokens: inputTokens,
-          output_tokens: outputTokens
-        }
-      };
+      if (content.length === 0) content.push({ type: 'text', text: accumulatedText.trim() });
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(responsePayload));
+      res.end(JSON.stringify({
+        id: messageId, type: 'message', role: 'assistant', model: modelName, content,
+        stop_reason: content.some(c => c.type === 'tool_use') ? 'tool_use' : 'end_turn',
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+      }));
     }
   });
 }
-
 // HTTP Server
 const server = http.createServer((req, res) => {
   // CORS Headers

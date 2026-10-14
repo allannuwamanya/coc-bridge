@@ -7,6 +7,15 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.3] — 2026-10-15
+
+### Fixed
+- **VS Code Extension Live Tool Calls**: Intercepts OpenCode native tool events in real time and immediately maps and forwards them as Anthropic SSE `tool_use` events (`Read`, `Bash`, `Glob`, `Grep`, `Edit`, `Write`) so Claude Code's extension displays live tool execution spinners, diffs, and approval prompts.
+- **Accurate `stop_reason` Logic**: Fixed a bug where text blocks triggered an erroneous `stop_reason: "tool_use"`, ensuring Claude Code correctly transitions between tool execution turns and final answers (`stop_reason: "end_turn"`).
+- **Multi-Turn Tool Result Handling**: Suppressed trailing text on tool_use pauses to prevent duplicate responses when Claude Code returns tool results.
+- **Real-Time Text Streaming**: Stream text deltas immediately for tool-free chat requests without blocking until process exit.
+- **Environment PATH Resilience**: Ensured child process PATH includes the node binary directory for headless and IDE extension invocations.
+
 ## [1.0.2] — 2026-10-14
 
 ### Added
