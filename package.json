@@ -1,0 +1,13 @@
+{
+  "name": "opencode-claude-bridge",
+  "version": "1.0.0",
+  "description": "Anthropic-compatible bridge proxy connecting Claude Code to OpenCode hosted models",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-client.js"
+  },
+  "keywords": ["claude-code", "opencode", "proxy", "bridge", "anthropic"],
+  "author": "Alan",
+  "license": "MIT"
+}
