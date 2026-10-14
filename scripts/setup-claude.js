@@ -138,15 +138,81 @@ if (!fs.existsSync(logDir)) {
 }
 
 // ─────────────────────────────────────────────
+// 5. Configure VS Code extension automatically
+// ─────────────────────────────────────────────
+step('5. Configuring VS Code Claude Code extension...');
+
+const vsCodeCandidates = [
+  path.join(os.homedir(), '.config', 'Code', 'User', 'settings.json'),
+  path.join(os.homedir(), '.var', 'app', 'com.visualstudio.code', 'config', 'Code', 'User', 'settings.json'),
+  path.join(os.homedir(), 'Library', 'Application Support', 'Code', 'User', 'settings.json'),
+  process.env.APPDATA ? path.join(process.env.APPDATA, 'Code', 'User', 'settings.json') : null
+].filter(Boolean);
+
+let vsCodeConfigured = false;
+for (const settingsPath of vsCodeCandidates) {
+  if (fs.existsSync(settingsPath)) {
+    try {
+      const raw = fs.readFileSync(settingsPath, 'utf8');
+      const stripJsonComments = str => str.replace(/\\"|"(?:\\"|[^"])*"|(\/\/.*|\/\*[\s\S]*?\*\/)/g, (m, g) => g ? '' : m);
+      const settings = JSON.parse(stripJsonComments(raw));
+
+      settings['claudeCode.claudeProcessWrapper'] = claudeBin;
+      settings['claudeCode.environmentVariables'] = [
+        { name: 'ANTHROPIC_BASE_URL', value: 'http://127.0.0.1:4045' },
+        { name: 'ANTHROPIC_AUTH_TOKEN', value: 'coc-local' },
+        { name: 'ANTHROPIC_API_KEY', value: '' },
+        { name: 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT', value: '1' },
+        { name: 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY', value: '1' },
+        { name: 'ANTHROPIC_MODEL', value: 'opencode/space-bunny-free' },
+        { name: 'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME', value: 'Space Bunny' },
+        { name: 'ANTHROPIC_DEFAULT_OPUS_MODEL', value: 'opencode/nemotron-3-ultra-free' },
+        { name: 'ANTHROPIC_DEFAULT_OPUS_MODEL_NAME', value: 'Nemotron 3 Ultra' },
+        { name: 'ANTHROPIC_DEFAULT_SONNET_MODEL', value: 'opencode/muse-spark-1.3-contributor-free' },
+        { name: 'ANTHROPIC_DEFAULT_SONNET_MODEL_NAME', value: 'Muse Spark 1.3' },
+        { name: 'ANTHROPIC_DEFAULT_HAIKU_MODEL', value: 'opencode/cat-jam-free' },
+        { name: 'ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME', value: 'Cat Jam' },
+        { name: 'ANTHROPIC_DEFAULT_FABLE_MODEL', value: 'opencode/ling-3.1-flash-free' },
+        { name: 'ANTHROPIC_DEFAULT_FABLE_MODEL_NAME', value: 'Ling 3.1 Flash' }
+      ];
+
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 4));
+      ok(`Configured VS Code: ${settingsPath}`);
+      vsCodeConfigured = true;
+    } catch (e) {
+      warn(`Could not automatically update ${settingsPath}: ${e.message}`);
+    }
+  }
+}
+
+if (!vsCodeConfigured) {
+  warn('VS Code settings not found. If using VS Code, set "claudeCode.claudeProcessWrapper": "' + claudeBin + '"');
+}
+
+// ─────────────────────────────────────────────
+// 6. Ensure ~/.local/bin symlink exists
+// ─────────────────────────────────────────────
+step('6. Ensuring CLI command availability...');
+try {
+  const localBin = path.join(os.homedir(), '.local', 'bin');
+  if (!fs.existsSync(localBin)) fs.mkdirSync(localBin, { recursive: true });
+  const targetLink = path.join(localBin, 'coc-bridge');
+  if (bridgeBin && !fs.existsSync(targetLink)) {
+    fs.symlinkSync(bridgeBin, targetLink);
+    ok(`Linked coc-bridge to ${targetLink}`);
+  }
+} catch (_) {}
+
+// ─────────────────────────────────────────────
 // Done
 // ─────────────────────────────────────────────
 console.log(`
 ${GREEN}${BOLD}✅  Setup complete!${RESET}
 
-  Run ${BOLD}claude${RESET} as normal — coc-bridge will auto-start in the background.
-
-  Verify anytime with:
-    ${BOLD}coc-bridge doctor${RESET}
+  • Terminal: Run ${BOLD}claude${RESET} as normal — coc-bridge auto-starts in background.
+  • VS Code : Open the Claude Code extension — models are connected!
+  • Switch models: ${BOLD}coc-bridge models${RESET} / ${BOLD}coc-bridge use <id>${RESET}
+  • Want normal Claude back? Run: ${BOLD}coc-bridge restore${RESET}
 
   Logs: ${logDir}/bridge.log
 `);

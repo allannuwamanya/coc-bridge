@@ -302,9 +302,10 @@ ${BOLD}COMMANDS${RESET}
   ${G}status${RESET}       Show whether the bridge is running
   ${G}logs${RESET}         Tail the live log file
   ${G}models${RESET}       List all available OpenCode models
-  ${G}use <id>${RESET}     Set the default model (saved to ~/.coc-bridge/config.json)
-  ${G}server${RESET}       Run in the foreground (useful for debugging)
-  ${G}setup${RESET}        Wire Claude Code to auto-start the bridge on login
+  ${G}use <id>${RESET}     Switch default model (saves to ~/.coc-bridge/config.json)
+  ${G}server${RESET}       Run in foreground (useful for debugging)
+  ${G}setup${RESET}        Wire Claude Code & VS Code to use the bridge
+  ${G}restore${RESET}      Revert Claude Code & VS Code back to official defaults
   ${G}doctor${RESET}       Check that Node, opencode, and claude are all wired up
 
 ${BOLD}ENVIRONMENT VARIABLES${RESET}
@@ -321,7 +322,8 @@ ${BOLD}EXAMPLES${RESET}
   coc-bridge stop                        # Shut it down
   coc-bridge status                      # Is it running?
   coc-bridge logs                        # Watch live logs
-  coc-bridge setup                       # One-time Claude Code wiring
+  coc-bridge setup                       # Wire Claude Code & VS Code
+  coc-bridge restore                     # Revert back to official Claude Code
   BRIDGE_PORT=5000 coc-bridge            # Custom port
 `);
 }
@@ -339,8 +341,9 @@ const cmd = process.argv[2] || 'start';
     case 'server':    cmdServer();                   break;
     case 'models':    cmdModels();                   break;
     case 'use':       cmdUse(process.argv[3]);       break;
-    case 'setup':     require(path.join(__dirname, '..', 'scripts', 'setup-claude.js')); break;
-    case 'doctor':    require(path.join(__dirname, '..', 'scripts', 'doctor.js'));       break;
+    case 'setup':     require(path.join(__dirname, '..', 'scripts', 'setup-claude.js'));   break;
+    case 'restore':   require(path.join(__dirname, '..', 'scripts', 'restore-claude.js')); break;
+    case 'doctor':    require(path.join(__dirname, '..', 'scripts', 'doctor.js'));         break;
     case '--version':
     case '-v': {
       const pkg = require('../package.json');

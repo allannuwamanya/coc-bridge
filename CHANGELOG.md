@@ -7,6 +7,16 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.2] — 2026-10-14
+
+### Added
+- **Claude Code Tool Control**: Claude Code now retains 100% control of tool execution (`View`, `Edit`, `Bash`, `Glob`, `Grep`, `Write`), showing interactive diffs, user permission confirmations, and spinners instead of OpenCode silently intercepting them
+- **Anthropic `tool_use` Event Streaming**: Bridges model responses directly to Anthropic SSE tool use events (`content_block_start`, `input_json_delta`, `message_delta` with `stop_reason: "tool_use"`)
+- **Accurate Real-Time Token Counts**: Extracted directly from model execution metrics rather than estimated token formulas
+- **`coc-bridge restore` command**: One-command rollback to revert Claude Code & VS Code back to official Anthropic defaults with zero friction
+- **Automatic VS Code Settings**: Configures Claude Code VS Code extension settings with robust JSONC comment-stripping support
+- **`coc-bridge models` & `coc-bridge use <id>`**: Live discovery and switching of default models saved to `~/.coc-bridge/config.json`
+
 ## [1.0.1] — 2026-10-14
 
 ### Fixed

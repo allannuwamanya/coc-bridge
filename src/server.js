@@ -9,6 +9,8 @@ const fs     = require('fs');
 const PORT             = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
 const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB
 const CONFIG_FILE      = path.join(os.homedir(), '.coc-bridge', 'config.json');
+const SANDBOX_DIR      = path.join(os.tmpdir(), 'coc-bridge-sandbox');
+try { fs.mkdirSync(SANDBOX_DIR, { recursive: true }); } catch (_) {}
 
 // ─── Config (persists user's chosen default model) ────────────────────────────
 function readConfig() {
@@ -126,60 +128,174 @@ function resolveModel(requested) {
 
 
 /**
- * Convert Anthropic message format into a clean prompt string for OpenCode CLI
+ * Extract tool calls from model output.
+ * Supports:
+ *  1. ```tool_call ... ``` or ```json ... ``` blocks
+ *  2. <tool_call> ... </tool_call> XML tags
+ *  3. Bare JSON object containing "name" and "input" matching an allowed tool
+ */
+function extractToolCalls(text, allowedTools = []) {
+  if (!text) return { text: '', toolCalls: [] };
+  const toolCalls = [];
+
+  // 1. Match markdown blocks
+  const blockRegex = /```(?:tool_call|json)?\s*\n?([\s\S]*?)\n?```/gi;
+  let match;
+  let textSegments = [];
+  let lastIndex = 0;
+
+  while ((match = blockRegex.exec(text)) !== null) {
+    let isTool = false;
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed && typeof parsed.name === 'string' && parsed.input !== undefined) {
+        const matchedTool = allowedTools.length === 0
+          ? parsed.name
+          : allowedTools.find(t => t.toLowerCase() === parsed.name.toLowerCase());
+        if (matchedTool) {
+          toolCalls.push({ name: matchedTool, input: parsed.input });
+          textSegments.push(text.slice(lastIndex, match.index));
+          lastIndex = blockRegex.lastIndex;
+          isTool = true;
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (toolCalls.length > 0) {
+    textSegments.push(text.slice(lastIndex));
+    const cleanText = textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { text: cleanText, toolCalls };
+  }
+
+  // 2. Match <tool_call> tags
+  const xmlRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
+  lastIndex = 0;
+  textSegments = [];
+  while ((match = xmlRegex.exec(text)) !== null) {
+    try {
+      const parsed = JSON.parse(match[1].trim());
+      if (parsed && typeof parsed.name === 'string' && parsed.input !== undefined) {
+        const matchedTool = allowedTools.length === 0
+          ? parsed.name
+          : allowedTools.find(t => t.toLowerCase() === parsed.name.toLowerCase());
+        if (matchedTool) {
+          toolCalls.push({ name: matchedTool, input: parsed.input });
+          textSegments.push(text.slice(lastIndex, match.index));
+          lastIndex = xmlRegex.lastIndex;
+        }
+      }
+    } catch (_) {}
+  }
+
+  if (toolCalls.length > 0) {
+    textSegments.push(text.slice(lastIndex));
+    const cleanText = textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return { text: cleanText, toolCalls };
+  }
+
+  // 3. Match bare JSON object with "name" and "input"
+  const bareMatch = text.match(/(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"input"\s*:\s*\{[\s\S]*?\}\s*\})/);
+  if (bareMatch) {
+    try {
+      const parsed = JSON.parse(bareMatch[1].trim());
+      if (parsed && typeof parsed.name === 'string' && parsed.input !== undefined) {
+        const matchedTool = allowedTools.length === 0
+          ? parsed.name
+          : allowedTools.find(t => t.toLowerCase() === parsed.name.toLowerCase());
+        if (matchedTool) {
+          const pre = text.slice(0, bareMatch.index).trim();
+          const post = text.slice(bareMatch.index + bareMatch[1].length).trim();
+          return {
+            text: [pre, post].filter(Boolean).join('\n'),
+            toolCalls: [{ name: matchedTool, input: parsed.input }]
+          };
+        }
+      }
+    } catch (_) {}
+  }
+
+  return { text: text.trim(), toolCalls: [] };
+}
+
+/**
+ * Convert Anthropic message format into a clean prompt string for OpenCode CLI,
+ * with full tool schemas injected so Claude Code controls tool execution.
  */
 function buildPrompt(body) {
   let promptParts = [];
+  const allowedTools = [];
 
-  // Add system instruction if present
-  if (body.system) {
-    if (typeof body.system === 'string') {
-      promptParts.push(`[System Instructions]\n${body.system}\n`);
-    } else if (Array.isArray(body.system)) {
-      const sysText = body.system.map(s => s.text || '').join('\n');
-      if (sysText.trim()) {
-        promptParts.push(`[System Instructions]\n${sysText}\n`);
+  // 1. Tool schemas and instructions
+  if (Array.isArray(body.tools) && body.tools.length > 0) {
+    let toolsDesc = '## Available Tools & Instructions\n';
+    toolsDesc += 'You are acting as the AI model for Claude Code. You do NOT have any built-in tools or direct filesystem access.\n';
+    toolsDesc += 'Do NOT attempt to use any internal OpenCode tools (like read, glob, shell, or edit).\n';
+    toolsDesc += 'Instead, to view files, make edits, run terminal commands, or list directories, you MUST emit a tool call in this exact JSON block:\n\n';
+    toolsDesc += '```tool_call\n';
+    toolsDesc += '{"name": "<ToolName>", "input": { ...arguments according to input schema... }}\n';
+    toolsDesc += '```\n\n';
+    toolsDesc += 'Claude Code will execute the tool on the user\'s local machine and return the result to you in the next message.\n';
+    toolsDesc += 'When you have enough information to answer the user without tools, reply with your normal explanation and NO tool_call blocks.\n\n';
+    toolsDesc += 'Tools available to request:\n';
+
+    for (const tool of body.tools) {
+      if (tool && tool.name) {
+        allowedTools.push(tool.name);
+        toolsDesc += `\n### Tool: ${tool.name}\n`;
+        if (tool.description) toolsDesc += `Description: ${tool.description}\n`;
+        if (tool.input_schema) toolsDesc += `Input Schema: ${JSON.stringify(tool.input_schema)}\n`;
       }
+    }
+
+    promptParts.push(`[System Instructions & Tools]\n${toolsDesc}\n`);
+  }
+
+  // 2. Add system prompt from Claude Code
+  if (body.system) {
+    let sysText = '';
+    if (typeof body.system === 'string') {
+      sysText = body.system;
+    } else if (Array.isArray(body.system)) {
+      sysText = body.system.map(s => (typeof s === 'string' ? s : (s.text || ''))).join('\n');
+    }
+    if (sysText.trim()) {
+      promptParts.push(`[Claude Code Instructions]\n${sysText.trim()}\n`);
     }
   }
 
-  // Add messages history
+  // 3. Add message history
   if (Array.isArray(body.messages)) {
     for (const msg of body.messages) {
       const role = msg.role === 'assistant' ? 'Assistant' : 'User';
-      let content = '';
 
       if (typeof msg.content === 'string') {
-        content = msg.content;
+        promptParts.push(`${role}: ${msg.content.trim()}`);
       } else if (Array.isArray(msg.content)) {
-        content = msg.content
-          .map(part => {
-            if (part.type === 'text') {
-              return part.text || '';
-            }
-            if (part.type === 'tool_use') {
-              const input = typeof part.input === 'object' ? JSON.stringify(part.input) : (part.input || '');
-              return `[Executed Tool: ${part.name}(${input})]`;
-            }
-            if (part.type === 'tool_result') {
-              const resContent = typeof part.content === 'string' ? part.content : JSON.stringify(part.content || '');
-              return `[Tool Result: ${resContent}]`;
-            }
-            return '';
-          })
-          .filter(Boolean)
-          .join('\n');
-      }
-
-      if (content.trim()) {
-        promptParts.push(`${role}: ${content}`);
+        let textParts = [];
+        for (const part of msg.content) {
+          if (part.type === 'text' && part.text) {
+            textParts.push(part.text);
+          } else if (part.type === 'tool_use') {
+            textParts.push(`\`\`\`tool_call\n${JSON.stringify({ name: part.name, input: part.input })}\n\`\`\``);
+          } else if (part.type === 'tool_result') {
+            const resContent = typeof part.content === 'string'
+              ? part.content
+              : (Array.isArray(part.content)
+                  ? part.content.map(c => c.text || JSON.stringify(c)).join('\n')
+                  : JSON.stringify(part.content || ''));
+            textParts.push(`[Tool Result for ${part.tool_use_id || 'tool'}]:\n${resContent}`);
+          }
+        }
+        if (textParts.length > 0) {
+          promptParts.push(`${role}: ${textParts.join('\n\n')}`);
+        }
       }
     }
   }
 
-  // If there's an agent prompt turn, make sure Assistant is ready to answer
   promptParts.push('Assistant:');
-  return promptParts.join('\n\n');
+  return { prompt: promptParts.join('\n\n'), allowedTools };
 }
 
 /**
@@ -196,14 +312,15 @@ function handleMessagesRequest(req, res, reqBody) {
   }
 
   const modelName = resolveModel(body.model);
-  const prompt = buildPrompt(body);
+  const { prompt, allowedTools } = buildPrompt(body);
   const isStreaming = Boolean(body.stream);
   const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
-  console.log(`[Bridge] Incoming request for model: ${modelName} (requested: ${body.model || 'none'}, streaming=${isStreaming})`);
+  console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming})`);
 
-  // Spawn OpenCode CLI as child process
-  const child = spawn(OPENCODE_BIN, ['run', '-m', modelName], {
+  // Run in empty sandbox dir so OpenCode cannot touch user files directly
+  const child = spawn(OPENCODE_BIN, ['run', '-m', modelName, '--format', 'json'], {
+    cwd: SANDBOX_DIR,
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env }
   });
@@ -226,108 +343,185 @@ function handleMessagesRequest(req, res, reqBody) {
     }
   });
 
-  // Write prompt to stdin and close
   child.stdin.write(prompt);
   child.stdin.end();
 
-  let accumulatedOutput = '';
+  let stdoutBuffer = '';
+  let accumulatedText = '';
   let accumulatedError = '';
+  let reportedTokens = null;
 
-  if (isStreaming) {
-    // Anthropic SSE headers
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
+  child.stdout.on('data', chunk => {
+    stdoutBuffer += chunk.toString();
+    const lines = stdoutBuffer.split('\n');
+    stdoutBuffer = lines.pop(); // keep partial line
 
-    // 1. message_start
-    res.write(`event: message_start\ndata: ${JSON.stringify({
-      type: 'message_start',
-      message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        model: modelName,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: Math.ceil(prompt.length / 4), output_tokens: 1 }
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+          accumulatedText += ev.part.text;
+        } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
+          reportedTokens = ev.part.tokens;
+        }
+      } catch (_) {
+        accumulatedText += line + '\n';
       }
-    })}\n\n`);
+    }
+  });
 
-    // 2. content_block_start
-    res.write(`event: content_block_start\ndata: ${JSON.stringify({
-      type: 'content_block_start',
-      index: 0,
-      content_block: { type: 'text', text: '' }
-    })}\n\n`);
+  child.stderr.on('data', chunk => {
+    accumulatedError += chunk.toString();
+  });
 
-    // Stream chunks as they arrive from OpenCode stdout
-    child.stdout.on('data', chunk => {
-      const text = chunk.toString();
-      accumulatedOutput += text;
-      res.write(`event: content_block_delta\ndata: ${JSON.stringify({
-        type: 'content_block_delta',
-        index: 0,
-        delta: { type: 'text_delta', text: text }
-      })}\n\n`);
-    });
+  child.on('close', code => {
+    clearTimeout(timer);
 
-    child.stderr.on('data', chunk => {
-      accumulatedError += chunk.toString();
-    });
+    // Process any remaining buffered stdout
+    if (stdoutBuffer.trim()) {
+      try {
+        const ev = JSON.parse(stdoutBuffer);
+        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+          accumulatedText += ev.part.text;
+        } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
+          reportedTokens = ev.part.tokens;
+        }
+      } catch (_) {
+        accumulatedText += stdoutBuffer;
+      }
+    }
 
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code !== 0 && !accumulatedOutput.trim()) {
-        console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
-        const errMsg = accumulatedError.trim() || `OpenCode CLI process exited with code ${code}`;
+    if (code !== 0 && !accumulatedText.trim()) {
+      console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
+      const errMsg = accumulatedError.trim() || `OpenCode process exited with code ${code}`;
+      if (isStreaming) {
+        res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
         res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: errMsg } })}\n\n`);
         res.end();
-        return;
+      } else {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: { type: 'api_error', message: errMsg } }));
+      }
+      return;
+    }
+
+    // Token accounting
+    const inputTokens = (reportedTokens && reportedTokens.input) || Math.ceil(prompt.length / 4);
+    const outputTokens = (reportedTokens && reportedTokens.output)
+      ? (reportedTokens.output + (reportedTokens.reasoning || 0))
+      : Math.ceil(accumulatedText.length / 4);
+
+    // Extract tool calls
+    const { text: cleanText, toolCalls } = extractToolCalls(accumulatedText, allowedTools);
+    const hasToolCalls = toolCalls.length > 0;
+    const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
+
+    if (isStreaming) {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      // 1. message_start
+      res.write(`event: message_start\ndata: ${JSON.stringify({
+        type: 'message_start',
+        message: {
+          id: messageId,
+          type: 'message',
+          role: 'assistant',
+          model: modelName,
+          content: [],
+          stop_reason: null,
+          stop_sequence: null,
+          usage: { input_tokens: inputTokens, output_tokens: 1 }
+        }
+      })}\n\n`);
+
+      let blockIndex = 0;
+
+      // 2. Text block (if clean text exists)
+      if (cleanText.length > 0) {
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: { type: 'text', text: '' }
+        })}\n\n`);
+
+        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: { type: 'text_delta', text: cleanText }
+        })}\n\n`);
+
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: 'content_block_stop',
+          index: blockIndex
+        })}\n\n`);
+
+        blockIndex++;
       }
 
-      // 3. content_block_stop
-      res.write(`event: content_block_stop\ndata: ${JSON.stringify({
-        type: 'content_block_stop',
-        index: 0
-      })}\n\n`);
+      // 3. Tool use blocks
+      for (const tc of toolCalls) {
+        const toolUseId = `toolu_${crypto.randomBytes(12).toString('hex')}`;
+
+        res.write(`event: content_block_start\ndata: ${JSON.stringify({
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'tool_use',
+            id: toolUseId,
+            name: tc.name,
+            input: {}
+          }
+        })}\n\n`);
+
+        res.write(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(tc.input)
+          }
+        })}\n\n`);
+
+        res.write(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: 'content_block_stop',
+          index: blockIndex
+        })}\n\n`);
+
+        blockIndex++;
+      }
 
       // 4. message_delta
       res.write(`event: message_delta\ndata: ${JSON.stringify({
         type: 'message_delta',
-        delta: { stop_reason: 'end_turn', stop_sequence: null },
-        usage: { output_tokens: Math.ceil(accumulatedOutput.length / 4) }
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { output_tokens: outputTokens }
       })}\n\n`);
 
       // 5. message_stop
       res.write(`event: message_stop\ndata: ${JSON.stringify({ type: 'message_stop' })}\n\n`);
       res.end();
-    });
 
-  } else {
-    // Non-streaming response
-    child.stdout.on('data', chunk => {
-      accumulatedOutput += chunk.toString();
-    });
-
-    child.stderr.on('data', chunk => {
-      accumulatedError += chunk.toString();
-    });
-
-    child.on('close', code => {
-      clearTimeout(timer);
-      if (code !== 0 && !accumulatedOutput.trim()) {
-        console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          error: {
-            type: 'api_error',
-            message: accumulatedError.trim() || `OpenCode CLI failed with exit code ${code}`
-          }
-        }));
-        return;
+    } else {
+      // Non-streaming response
+      const content = [];
+      if (cleanText.length > 0) {
+        content.push({ type: 'text', text: cleanText });
+      }
+      for (const tc of toolCalls) {
+        content.push({
+          type: 'tool_use',
+          id: `toolu_${crypto.randomBytes(12).toString('hex')}`,
+          name: tc.name,
+          input: tc.input
+        });
+      }
+      if (content.length === 0) {
+        content.push({ type: 'text', text: accumulatedText.trim() });
       }
 
       const responsePayload = {
@@ -335,24 +529,19 @@ function handleMessagesRequest(req, res, reqBody) {
         type: 'message',
         role: 'assistant',
         model: modelName,
-        content: [
-          {
-            type: 'text',
-            text: accumulatedOutput.trim()
-          }
-        ],
-        stop_reason: 'end_turn',
+        content,
+        stop_reason: stopReason,
         stop_sequence: null,
         usage: {
-          input_tokens: Math.ceil(prompt.length / 4),
-          output_tokens: Math.ceil(accumulatedOutput.length / 4)
+          input_tokens: inputTokens,
+          output_tokens: outputTokens
         }
       };
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(responsePayload));
-    });
-  }
+    }
+  });
 }
 
 // HTTP Server
