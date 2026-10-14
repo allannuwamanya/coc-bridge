@@ -20,8 +20,9 @@ const OPENCODE_MODELS = [
   { id: 'opencode/big-pickle', display_name: 'Big Pickle (Free)' }
 ];
 
-// Map shortcuts / aliases to full OpenCode model IDs
+// Map shortcuts, aliases, and standard Anthropic menu names to OpenCode models
 const MODEL_ALIASES = {
+  // OpenCode aliases
   'space-bunny': 'opencode/space-bunny-free',
   'space-bunny-free': 'opencode/space-bunny-free',
   'cat-jam': 'opencode/cat-jam-free',
@@ -34,14 +35,35 @@ const MODEL_ALIASES = {
   'ling-flash': 'opencode/ling-3.1-flash-free',
   'longcat': 'opencode/longcat-2.5-preview-free',
   'mimo': 'opencode/mimo-v2.6-flash-free',
-  'big-pickle': 'opencode/big-pickle'
+  'big-pickle': 'opencode/big-pickle',
+
+  // Standard VS Code dropdown menu selections mapped to best OpenCode models
+  'opus': 'opencode/nemotron-3-ultra-free',
+  'claude-3-opus': 'opencode/nemotron-3-ultra-free',
+  'claude-opus-5': 'opencode/nemotron-3-ultra-free',
+  'claude-opus-5-5': 'opencode/nemotron-3-ultra-free',
+  'sonnet': 'opencode/muse-spark-1.3-contributor-free',
+  'claude-3-5-sonnet': 'opencode/muse-spark-1.3-contributor-free',
+  'claude-sonnet-5-5': 'opencode/muse-spark-1.3-contributor-free',
+  'haiku': 'opencode/cat-jam-free',
+  'claude-3-5-haiku': 'opencode/cat-jam-free',
+  'claude-haiku-5-5': 'opencode/cat-jam-free',
+  'fable': 'opencode/ling-3.1-flash-free',
+  'claude-3-5-fable': 'opencode/ling-3.1-flash-free',
+  'claude-fable-5-1': 'opencode/ling-3.1-flash-free'
 };
 
 function resolveModel(requestedModel) {
   if (!requestedModel) return DEFAULT_MODEL;
   if (requestedModel.startsWith('opencode/')) return requestedModel;
-  if (MODEL_ALIASES[requestedModel]) return MODEL_ALIASES[requestedModel];
-  // Default fallback for generic Claude model names (e.g., claude-3-5-sonnet)
+  
+  const lower = requestedModel.toLowerCase();
+  if (MODEL_ALIASES[lower]) return MODEL_ALIASES[lower];
+
+  for (const [alias, fullId] of Object.entries(MODEL_ALIASES)) {
+    if (lower.includes(alias)) return fullId;
+  }
+  
   return DEFAULT_MODEL;
 }
 
