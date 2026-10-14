@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Test on Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node: ['18', '20', '22', '24']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      - name: Install opencode
+        run: npm install -g opencode
+
+      - name: Verify opencode binary
+        run: opencode --version
+
+      - name: Start coc-bridge server in background
+        run: |
+          node src/server.js &
+          # Wait for the bridge to be ready
+          for i in $(seq 1 40); do
+            sleep 0.5
+            if curl -sf http://127.0.0.1:4045/health > /dev/null 2>&1; then
+              echo "Bridge is up!"
+              break
+            fi
+          done
+
+      - name: Run test suite
+        run: node test/test-client.js
+
+  lint:
+    name: Lint (node --check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Syntax check all JS files
+        run: |
+          node --check src/server.js
+          node --check bin/coc-bridge.js
+          node --check scripts/setup-claude.js
+          node --check scripts/doctor.js
+          node --check test/test-client.js
+          echo "All files pass syntax check ✔"
