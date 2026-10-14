@@ -7,6 +7,44 @@ const PORT = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10)
 const OPENCODE_BIN = process.env.OPENCODE_BIN || '/home/alan/.nvm/versions/node/v24.21.0/bin/opencode';
 const DEFAULT_MODEL = process.env.OPENCODE_MODEL || 'opencode/space-bunny-free';
 
+// List of available OpenCode free models for Claude Code's model discovery (/model)
+const OPENCODE_MODELS = [
+  { id: 'opencode/space-bunny-free', display_name: 'Space Bunny (Free - Default)' },
+  { id: 'opencode/cat-jam-free', display_name: 'Cat Jam (Free)' },
+  { id: 'opencode/muse-spark-1.3-contributor-free', display_name: 'Muse Spark 1.3 (Free - Meta Reasoning)' },
+  { id: 'opencode/nemotron-3-ultra-free', display_name: 'NVIDIA Nemotron 3 Ultra (Free)' },
+  { id: 'opencode/nemotron-3.5-lightning-free', display_name: 'NVIDIA Nemotron 3.5 Lightning (Free)' },
+  { id: 'opencode/ling-3.1-flash-free', display_name: 'Ling 3.1 Flash (Free)' },
+  { id: 'opencode/longcat-2.5-preview-free', display_name: 'Longcat 2.5 Preview (Free)' },
+  { id: 'opencode/mimo-v2.6-flash-free', display_name: 'Mimo 2.6 Flash (Free)' },
+  { id: 'opencode/big-pickle', display_name: 'Big Pickle (Free)' }
+];
+
+// Map shortcuts / aliases to full OpenCode model IDs
+const MODEL_ALIASES = {
+  'space-bunny': 'opencode/space-bunny-free',
+  'space-bunny-free': 'opencode/space-bunny-free',
+  'cat-jam': 'opencode/cat-jam-free',
+  'cat-jam-free': 'opencode/cat-jam-free',
+  'muse-spark': 'opencode/muse-spark-1.3-contributor-free',
+  'muse-spark-1.3': 'opencode/muse-spark-1.3-contributor-free',
+  'nemotron': 'opencode/nemotron-3-ultra-free',
+  'nemotron-ultra': 'opencode/nemotron-3-ultra-free',
+  'nemotron-lightning': 'opencode/nemotron-3.5-lightning-free',
+  'ling-flash': 'opencode/ling-3.1-flash-free',
+  'longcat': 'opencode/longcat-2.5-preview-free',
+  'mimo': 'opencode/mimo-v2.6-flash-free',
+  'big-pickle': 'opencode/big-pickle'
+};
+
+function resolveModel(requestedModel) {
+  if (!requestedModel) return DEFAULT_MODEL;
+  if (requestedModel.startsWith('opencode/')) return requestedModel;
+  if (MODEL_ALIASES[requestedModel]) return MODEL_ALIASES[requestedModel];
+  // Default fallback for generic Claude model names (e.g., claude-3-5-sonnet)
+  return DEFAULT_MODEL;
+}
+
 /**
  * Convert Anthropic message format into a clean prompt string for OpenCode CLI
  */
@@ -68,18 +106,12 @@ function handleMessagesRequest(req, res, reqBody) {
     return;
   }
 
-  // Determine model: if requested model starts with "opencode/", use it directly;
-  // otherwise default to space-bunny-free (or configured default)
-  let modelName = body.model || DEFAULT_MODEL;
-  if (!modelName.startsWith('opencode/')) {
-    modelName = DEFAULT_MODEL;
-  }
-
+  const modelName = resolveModel(body.model);
   const prompt = buildPrompt(body);
   const isStreaming = Boolean(body.stream);
   const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
 
-  console.log(`[Bridge] Incoming request for model: ${modelName} (streaming=${isStreaming})`);
+  console.log(`[Bridge] Incoming request for model: ${modelName} (requested: ${body.model || 'none'}, streaming=${isStreaming})`);
 
   // Spawn OpenCode CLI as child process
   const child = spawn(OPENCODE_BIN, ['run', '-m', modelName], {
@@ -236,7 +268,22 @@ const server = http.createServer((req, res) => {
       status: 'ok',
       service: 'opencode-claude-bridge',
       defaultModel: DEFAULT_MODEL,
+      availableModels: OPENCODE_MODELS.map(m => m.id),
       opencodeBinary: OPENCODE_BIN
+    }));
+    return;
+  }
+
+  // Model discovery endpoint for Claude Code (/v1/models)
+  if (req.method === 'GET' && (url === '/v1/models' || url === '/api/v1/models' || url === '/models')) {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      data: OPENCODE_MODELS.map(m => ({
+        id: m.id,
+        display_name: m.display_name,
+        type: 'model',
+        created_at: 1728864000
+      }))
     }));
     return;
   }
@@ -261,6 +308,7 @@ server.listen(PORT, '127.0.0.1', () => {
   console.log(`=======================================================`);
   console.log(` [OpenCode-Claude Bridge] listening on http://127.0.0.1:${PORT}`);
   console.log(` Default model: ${DEFAULT_MODEL}`);
+  console.log(` Model discovery: http://127.0.0.1:${PORT}/v1/models`);
   console.log(` Compatible endpoint: http://127.0.0.1:${PORT}/v1/messages`);
   console.log(`=======================================================`);
 });
