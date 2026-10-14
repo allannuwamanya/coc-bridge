@@ -164,9 +164,10 @@ function handleMessagesRequest(req, res, reqBody) {
   }, timeoutMs);
 
   // Clean up child process if client disconnects early
-  req.on('close', () => {
+  res.on('close', () => {
     clearTimeout(timer);
-    if (!child.killed) {
+    if (!res.writableEnded && !child.killed) {
+      console.warn(`[Bridge] Client connection closed prematurely, terminating child process`);
       child.kill('SIGTERM');
     }
   });
