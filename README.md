@@ -1,6 +1,6 @@
 # coc-bridge 🔌✨
 
-> **The missing link between Claude Code and OpenCode.** 🤝🚀
+> **Just two agents. One little secret 🔥**
 
 Claude Code wanted to hang out with OpenCode. OpenCode wanted to hang out with Claude Code.  
 So we built the handshake. 🥂
