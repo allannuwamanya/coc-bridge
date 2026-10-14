@@ -2,3 +2,10 @@
 bridge.log
 node_modules/
 .DS_Store
+.env
+.env.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.npmrc
+*.tgz

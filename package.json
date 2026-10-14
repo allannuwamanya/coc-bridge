@@ -1,13 +1,56 @@
 {
-  "name": "opencode-claude-bridge",
+  "name": "coc-bridge",
   "version": "1.0.0",
-  "description": "Anthropic-compatible bridge proxy connecting Claude Code to OpenCode hosted models",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "test": "node test-client.js"
+  "description": "A zero-dependency local bridge that connects Claude Code to OpenCode's free hosted models — no API keys required.",
+  "main": "src/server.js",
+  "bin": {
+    "coc-bridge": "./bin/coc-bridge.js",
+    "coc-bridge-start": "./bin/coc-bridge.js"
   },
-  "keywords": ["claude-code", "opencode", "proxy", "bridge", "anthropic"],
-  "author": "Alan",
-  "license": "MIT"
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "BRIDGE_LOG_LEVEL=debug node src/server.js",
+    "test": "node test/test-client.js",
+    "install-claude": "node scripts/setup-claude.js",
+    "doctor": "node scripts/doctor.js"
+  },
+  "keywords": [
+    "claude-code",
+    "opencode",
+    "anthropic",
+    "proxy",
+    "bridge",
+    "ai",
+    "llm",
+    "free",
+    "claude",
+    "opencode-bridge"
+  ],
+  "author": {
+    "name": "Allan Nuwamanya",
+    "email": "allan.info.comp@gmail.com",
+    "url": "https://github.com/allannuwamanya"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/allannuwamanya/coc-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/allannuwamanya/coc-bridge/issues"
+  },
+  "homepage": "https://github.com/allannuwamanya/coc-bridge#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "files": [
+    "bin/",
+    "src/",
+    "scripts/",
+    "test/",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "preferGlobal": true
 }

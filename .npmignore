@@ -1,0 +1,8 @@
+# Files/dirs excluded from the npm package tarball
+.git/
+.github/
+*.log
+bridge.log
+.DS_Store
+.env
+.env.local
