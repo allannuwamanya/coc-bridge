@@ -464,7 +464,7 @@ function handleMessagesRequest(req, res, reqBody) {
 
   // ── Spawn opencode ────────────────────────────────────────────────────────────
   // --standalone: own private server, no port conflict with background opencode.
-  const childArgs = ['run', '-m', modelName, '--format', 'json'];
+  const childArgs = ['run', '-m', modelName, '--format', 'json', '--thinking'];
   // Note: --standalone may not be supported by all opencode versions; try without if it fails
   const binDir = path.dirname(OPENCODE_BIN);
   const childEnv = {
@@ -489,9 +489,12 @@ function handleMessagesRequest(req, res, reqBody) {
   // ── SSE state ─────────────────────────────────────────────────────────────────
   let sseStarted = false;
   let blockIndex = 0;
+  let thinkingBlockIndex = -1;
+  let thinkingClosed = false;
   let textBlockIndex = -1;
   let inputTokens = Math.ceil(prompt.length / 4);
   let outputTokens = 0;
+  let accumulatedThinking = '';
   let accumulatedText = '';
   let reportedTokens = null;
   let clientClosed = false;
@@ -525,8 +528,34 @@ function handleMessagesRequest(req, res, reqBody) {
     try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
   }
 
+  function emitThinking(chunk) {
+    if (!chunk || !isStreaming) return;
+    startSSE();
+    if (thinkingBlockIndex === -1) {
+      thinkingBlockIndex = blockIndex++;
+      sseWrite('content_block_start', {
+        type: 'content_block_start',
+        index: thinkingBlockIndex,
+        content_block: { type: 'thinking', thinking: '' }
+      });
+    }
+    sseWrite('content_block_delta', {
+      type: 'content_block_delta',
+      index: thinkingBlockIndex,
+      delta: { type: 'thinking_delta', thinking: chunk }
+    });
+  }
+
+  function closeThinking() {
+    if (thinkingBlockIndex !== -1 && !thinkingClosed) {
+      thinkingClosed = true;
+      sseWrite('content_block_stop', { type: 'content_block_stop', index: thinkingBlockIndex });
+    }
+  }
+
   function emitToolUse(toolName, toolInput) {
     if (!isStreaming) return;
+    closeThinking();
     startSSE();
     const mapped = mapOpenCodeTool(toolName, toolInput || {}, allowedTools, projectDir);
 
@@ -555,6 +584,7 @@ function handleMessagesRequest(req, res, reqBody) {
 
   function emitText(text) {
     if (!text || !text.trim() || !isStreaming) return;
+    closeThinking();
     startSSE();
     sseWrite('content_block_start', {
       type: 'content_block_start', index: blockIndex,
@@ -592,8 +622,15 @@ function handleMessagesRequest(req, res, reqBody) {
       let ev;
       try { ev = JSON.parse(line); } catch (_) { continue; }
 
+      // ── Model thinking / reasoning ───────────────────────────────────────
+      if (ev.type === 'reasoning' && ev.part && typeof ev.part.text === 'string') {
+        accumulatedThinking += ev.part.text;
+        emitThinking(ev.part.text);
+      }
+
       // ── OpenCode native tool events ──────────────────────────────────────
       if (ev.type === 'tool_use' && ev.part) {
+        closeThinking();
         const part      = ev.part;
         const toolName  = part.tool || part.name || '';
         const toolState = part.state || {};
@@ -615,6 +652,7 @@ function handleMessagesRequest(req, res, reqBody) {
 
       // ── Model text ───────────────────────────────────────────────────────
       if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+        closeThinking();
         accumulatedText += ev.part.text;
         if (isStreaming && allowedTools.length === 0) {
           if (!sseStarted) startSSE();
@@ -653,17 +691,24 @@ function handleMessagesRequest(req, res, reqBody) {
     if (stdoutBuffer.trim()) {
       try {
         const ev = JSON.parse(stdoutBuffer);
-        if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+        if (ev.type === 'reasoning' && ev.part && typeof ev.part.text === 'string') {
+          accumulatedThinking += ev.part.text;
+          emitThinking(ev.part.text);
+        } else if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
+          closeThinking();
           accumulatedText += ev.part.text;
         } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
           reportedTokens = ev.part.tokens;
         } else if (ev.type === 'tool_use' && ev.part) {
+          closeThinking();
           const part = ev.part;
           const toolState = part.state || {};
           emitToolUse(part.tool || '', toolState.input || {});
         }
       } catch (_) {}
     }
+
+    closeThinking();
 
     // Error: process failed, nothing useful
     if (code !== 0 && !accumulatedText.trim() && nativeToolsEmitted === 0) {
@@ -725,6 +770,9 @@ function handleMessagesRequest(req, res, reqBody) {
       // Non-streaming response
       const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
       const content = [];
+      if (accumulatedThinking.trim()) {
+        content.push({ type: 'thinking', thinking: accumulatedThinking.trim() });
+      }
       if (cleanText.length > 0) content.push({ type: 'text', text: cleanText });
       for (const tc of textToolCalls) {
         content.push({

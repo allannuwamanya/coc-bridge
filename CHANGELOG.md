@@ -7,6 +7,11 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.5] — 2026-10-15
+
+### Added
+- **Full Thinking & Reasoning Streaming**: Added `--thinking` flag to OpenCode execution, capturing model reasoning blocks (`ev.type === 'reasoning'`) and streaming them in Anthropic's extended thinking SSE protocol (`content_block_start` with `type: "thinking"` and `thinking_delta`). Claude Code now displays live collapsible "Thinking..." dropdown boxes just like native Claude 3.7 Thinking.
+
 ## [1.0.4] — 2026-10-15
 
 ### Fixed
