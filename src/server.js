@@ -1,23 +1,31 @@
 #!/usr/bin/env node
-const http   = require('http');
-const { spawn, execSync, spawnSync } = require('child_process');
-const crypto = require('crypto');
-const path   = require('path');
-const os     = require('os');
-const fs     = require('fs');
+/**
+ * coc-bridge server — v1.1.0
+ *
+ * Architecture: Claude Code is the AGENT (reads files, edits, runs bash, asks permission).
+ *               OpenCode is ONLY the LLM (pure text in → text out).
+ *
+ * Uses `opencode api session.generate` — stateless, zero-agent, zero-tool-call LLM inference.
+ * OpenCode never searches your files or runs commands. Claude Code does all of that.
+ */
+'use strict';
 
-const PORT             = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
-const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50MB
-const CONFIG_FILE      = path.join(os.homedir(), '.coc-bridge', 'config.json');
-const SANDBOX_DIR      = path.join(os.tmpdir(), 'coc-bridge-sandbox');
-try { fs.mkdirSync(SANDBOX_DIR, { recursive: true }); } catch (_) {}
+const http    = require('http');
+const { execSync, spawnSync } = require('child_process');
+const crypto  = require('crypto');
+const path    = require('path');
+const os      = require('os');
+const fs      = require('fs');
 
-// ─── Config (persists user's chosen default model) ────────────────────────────
+const PORT              = parseInt(process.env.BRIDGE_PORT || process.env.PORT || '4045', 10);
+const MAX_PAYLOAD_BYTES = 50 * 1024 * 1024; // 50 MB
+const CONFIG_FILE       = path.join(os.homedir(), '.coc-bridge', 'config.json');
+
+// ─── Config ──────────────────────────────────────────────────────────────────
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8')); } catch (_) { return {}; }
 }
-
-const config       = readConfig();
+const config        = readConfig();
 const DEFAULT_MODEL = process.env.OPENCODE_MODEL || config.defaultModel || 'opencode/space-bunny-free';
 
 // ─── Find opencode binary ─────────────────────────────────────────────────────
@@ -36,67 +44,43 @@ function findOpencodeBin() {
     const which = execSync('which opencode', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
     if (which && !candidates.includes(which)) candidates.unshift(which);
   } catch (_) {}
-
   for (const c of candidates) {
     try {
       fs.accessSync(c, fs.constants.X_OK);
-      const real = fs.realpathSync(c);
-      const binDir = path.dirname(real);
-      if (fs.existsSync(path.join(binDir, 'opencode-bin')) || fs.existsSync(real)) {
-        return real;
-      }
+      return fs.realpathSync(c);
     } catch (_) {}
   }
-  console.error('[coc-bridge] ❌  Cannot find opencode binary.\n  Install it: npm install -g opencode\n  Or set: OPENCODE_BIN=/path/to/opencode');
+  console.error('[coc-bridge] ❌  Cannot find opencode binary.\n  Install: npm install -g opencode\n  Or set: OPENCODE_BIN=/path/to/opencode');
   process.exit(1);
 }
 const OPENCODE_BIN = findOpencodeBin();
+const OPENCODE_BIN_DIR = path.dirname(OPENCODE_BIN);
 
-// ─── Dynamic model discovery ──────────────────────────────────────────────────
-// Calls `opencode models` to get whatever models the user's opencode instance
-// actually has access to — free, paid, or custom providers.
+// ─── Model list ──────────────────────────────────────────────────────────────
 function fetchAvailableModels() {
   try {
     const result = spawnSync(OPENCODE_BIN, ['models'], {
-      encoding: 'utf8',
-      timeout: 10000,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'],
+      env: { ...process.env, PATH: OPENCODE_BIN_DIR + path.delimiter + process.env.PATH }
     });
     if (result.status !== 0 || !result.stdout) return null;
-    const ids = result.stdout
-      .split('\n')
-      .map(l => l.trim())
-      .filter(Boolean);
-    return ids.map(id => ({
-      id,
-      display_name: formatModelName(id),
+    return result.stdout.split('\n').map(l => l.trim()).filter(Boolean).map(id => ({
+      id, display_name: formatModelName(id)
     }));
-  } catch (_) {
-    return null;
-  }
+  } catch (_) { return null; }
 }
-
-// Make a readable name from the model id, e.g. "opencode/cat-jam-free" → "Cat Jam (Free)"
 function formatModelName(id) {
-  const slug = id.replace(/^[^/]+\//, ''); // strip provider prefix
+  const slug = id.replace(/^[^/]+\//, '');
   return slug
-    .replace(/-free$/, ' (Free)')
-    .replace(/-preview$/, ' (Preview)')
-    .replace(/-contributor-free$/, ' (Free)')
-    .replace(/-/g, ' ')
+    .replace(/-free$/, ' (Free)').replace(/-preview$/, ' (Preview)')
+    .replace(/-contributor-free$/, ' (Free)').replace(/-/g, ' ')
     .replace(/\b\w/g, c => c.toUpperCase())
-    .replace(/\(free\)/i, '(Free)')
-    .replace(/\(preview\)/i, '(Preview)')
-    .trim();
+    .replace(/\(free\)/i, '(Free)').replace(/\(preview\)/i, '(Preview)').trim();
 }
-
-// Fetch at startup; fall back to a minimal list if opencode models fails
 let OPENCODE_MODELS = fetchAvailableModels() || [
-  { id: 'opencode/space-bunny-free', display_name: 'Space Bunny (Free)' },
+  { id: 'opencode/space-bunny-free', display_name: 'Space Bunny (Free)' }
 ];
 console.log(`[coc-bridge] Loaded ${OPENCODE_MODELS.length} model(s) from opencode`);
-
-// Refresh model list periodically (every 10 min) without restarting the server
 setInterval(() => {
   const fresh = fetchAvailableModels();
   if (fresh && fresh.length > 0) {
@@ -106,59 +90,132 @@ setInterval(() => {
 }, 10 * 60 * 1000);
 
 // ─── Model resolution ─────────────────────────────────────────────────────────
-// Resolves whatever Claude Code sends (full id, short name, or Claude tier name)
-// to the actual opencode model string.
 function resolveModel(requested) {
   if (!requested) return DEFAULT_MODEL;
-
-  // Exact match in the live model list
   if (OPENCODE_MODELS.some(m => m.id === requested)) return requested;
-
-  // Any opencode/ prefixed id is passed through directly (user might have
-  // models not yet in the cached list, e.g. just added a provider)
   if (requested.startsWith('opencode/') || requested.includes('/')) return requested;
-
   const lower = requested.toLowerCase();
-
-  // Substring fuzzy match against known model ids
   const fuzzy = OPENCODE_MODELS.find(m => m.id.toLowerCase().includes(lower));
   if (fuzzy) return fuzzy.id;
-
-  // Claude Code tier names → sensible defaults (user can override with config)
   const tierMap = config.tierMap || {};
   const builtinTierMap = {
     'opus':   config.opusModel   || OPENCODE_MODELS.find(m => m.id.includes('nemotron') && m.id.includes('ultra'))?.id || DEFAULT_MODEL,
     'sonnet': config.sonnetModel || OPENCODE_MODELS.find(m => m.id.includes('muse') || m.id.includes('spark'))?.id     || DEFAULT_MODEL,
     'haiku':  config.haikuModel  || OPENCODE_MODELS.find(m => m.id.includes('cat') || m.id.includes('jam'))?.id        || DEFAULT_MODEL,
-    'fable':  config.fableModel  || OPENCODE_MODELS.find(m => m.id.includes('ling') || m.id.includes('flash'))?.id     || DEFAULT_MODEL,
   };
   for (const [tier, target] of Object.entries({ ...builtinTierMap, ...tierMap })) {
     if (lower.includes(tier)) return target;
   }
-
   return DEFAULT_MODEL;
 }
 
+// ─── Parse model string "opencode/space-bunny-free" → { providerID, id } ─────
+function parseModel(modelStr) {
+  const parts = modelStr.split('/');
+  if (parts.length >= 2) {
+    const providerID = parts[0];
+    const id = parts.slice(1).join('/');
+    return { providerID, id };
+  }
+  return { providerID: 'opencode', id: modelStr };
+}
 
-/**
- * Extract tool calls from model output.
- * Supports:
- *  1. ```tool_call ... ``` or ```json ... ``` blocks
- *  2. <tool_call> ... </tool_call> XML tags
- *  3. Bare JSON object containing "name" and "input" matching an allowed tool
- */
+// ─── Session pool: one reusable session per (providerID/model) ───────────────
+const sessionPool = new Map(); // modelStr → sessionID
+
+function runOpenCodeApi(...args) {
+  const result = spawnSync(OPENCODE_BIN, ['api', ...args], {
+    encoding: 'utf8',
+    timeout: 120000,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, PATH: OPENCODE_BIN_DIR + path.delimiter + process.env.PATH }
+  });
+  const out = result.stdout ? result.stdout.trim() : '';
+  const err = result.stderr ? result.stderr.trim() : '';
+  if (result.status !== 0) throw new Error(`opencode api exit ${result.status}: ${err || out}`);
+  return out;
+}
+
+function getOrCreateSession(modelStr) {
+  if (sessionPool.has(modelStr)) return sessionPool.get(modelStr);
+  try {
+    const { providerID, id } = parseModel(modelStr);
+    const body = JSON.stringify({
+      title: `coc-bridge-${providerID}-${id}`,
+    });
+    const out = runOpenCodeApi('POST', '/api/session', '-d', body);
+    const json = JSON.parse(out);
+    const sessionID = json.data?.id || json.id;
+    if (!sessionID) throw new Error('No session ID in response: ' + out);
+    // Set the model for this session
+    try {
+      runOpenCodeApi('PUT', `/api/session/${sessionID}/model`,
+        '-d', JSON.stringify({ providerID, id })
+      );
+    } catch (_) {} // non-fatal — uses session default
+    sessionPool.set(modelStr, sessionID);
+    console.log(`[Bridge] Created session ${sessionID} for model ${modelStr}`);
+    return sessionID;
+  } catch (err) {
+    throw new Error('Failed to create opencode session: ' + err.message);
+  }
+}
+
+// ─── Build a plain-text prompt from Anthropic message array ──────────────────
+function buildPrompt(body) {
+  const parts = [];
+
+  // System prompt
+  if (body.system) {
+    let sys = '';
+    if (typeof body.system === 'string') sys = body.system;
+    else if (Array.isArray(body.system)) {
+      sys = body.system.map(s => typeof s === 'string' ? s : (s.text || '')).join('\n');
+    }
+    if (sys.trim()) parts.push(`[SYSTEM]\n${sys.trim()}\n[/SYSTEM]`);
+  }
+
+  // Message history
+  if (Array.isArray(body.messages)) {
+    for (const msg of body.messages) {
+      const role = msg.role === 'assistant' ? 'Assistant' : 'User';
+      if (typeof msg.content === 'string') {
+        parts.push(`${role}: ${msg.content.trim()}`);
+      } else if (Array.isArray(msg.content)) {
+        const textParts = [];
+        for (const part of msg.content) {
+          if (part.type === 'text' && part.text) {
+            textParts.push(part.text);
+          } else if (part.type === 'tool_use') {
+            textParts.push(`[Tool: ${part.name}]\nInput: ${JSON.stringify(part.input)}`);
+          } else if (part.type === 'tool_result') {
+            const content = typeof part.content === 'string'
+              ? part.content
+              : Array.isArray(part.content)
+                ? part.content.map(c => c.text || JSON.stringify(c)).join('\n')
+                : JSON.stringify(part.content || '');
+            textParts.push(`[Tool Result]:\n${content}`);
+          } else if (part.type === 'thinking') {
+            // Skip prior thinking blocks in history — they confuse the model
+          }
+        }
+        if (textParts.length > 0) parts.push(`${role}: ${textParts.join('\n\n')}`);
+      }
+    }
+  }
+
+  return parts.join('\n\n');
+}
+
+// ─── Extract tool calls from text ────────────────────────────────────────────
 function extractToolCalls(text, allowedTools = []) {
   if (!text) return { text: '', toolCalls: [] };
   const toolCalls = [];
 
-  // 1. Match markdown blocks
+  // Match ```tool_call / ```json blocks
   const blockRegex = /```(?:tool_call|json)?\s*\n?([\s\S]*?)\n?```/gi;
-  let match;
-  let textSegments = [];
-  let lastIndex = 0;
-
+  let match, textSegments = [], lastIndex = 0;
   while ((match = blockRegex.exec(text)) !== null) {
-    let isTool = false;
     try {
       const parsed = JSON.parse(match[1].trim());
       if (parsed && typeof parsed.name === 'string' && parsed.input !== undefined) {
@@ -169,22 +226,18 @@ function extractToolCalls(text, allowedTools = []) {
           toolCalls.push({ name: matchedTool, input: parsed.input });
           textSegments.push(text.slice(lastIndex, match.index));
           lastIndex = blockRegex.lastIndex;
-          isTool = true;
         }
       }
     } catch (_) {}
   }
-
   if (toolCalls.length > 0) {
     textSegments.push(text.slice(lastIndex));
-    const cleanText = textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    return { text: cleanText, toolCalls };
+    return { text: textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim(), toolCalls };
   }
 
-  // 2. Match <tool_call> tags
+  // Match <tool_call> XML tags
   const xmlRegex = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi;
-  lastIndex = 0;
-  textSegments = [];
+  lastIndex = 0; textSegments = [];
   while ((match = xmlRegex.exec(text)) !== null) {
     try {
       const parsed = JSON.parse(match[1].trim());
@@ -200,740 +253,258 @@ function extractToolCalls(text, allowedTools = []) {
       }
     } catch (_) {}
   }
-
   if (toolCalls.length > 0) {
     textSegments.push(text.slice(lastIndex));
-    const cleanText = textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-    return { text: cleanText, toolCalls };
-  }
-
-  // 3. Match bare JSON object with "name" and "input"
-  const bareMatch = text.match(/(\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"input"\s*:\s*\{[\s\S]*?\}\s*\})/);
-  if (bareMatch) {
-    try {
-      const parsed = JSON.parse(bareMatch[1].trim());
-      if (parsed && typeof parsed.name === 'string' && parsed.input !== undefined) {
-        const matchedTool = allowedTools.length === 0
-          ? parsed.name
-          : allowedTools.find(t => t.toLowerCase() === parsed.name.toLowerCase());
-        if (matchedTool) {
-          const pre = text.slice(0, bareMatch.index).trim();
-          const post = text.slice(bareMatch.index + bareMatch[1].length).trim();
-          return {
-            text: [pre, post].filter(Boolean).join('\n'),
-            toolCalls: [{ name: matchedTool, input: parsed.input }]
-          };
-        }
-      }
-    } catch (_) {}
+    return { text: textSegments.join('\n').replace(/\n{3,}/g, '\n\n').trim(), toolCalls };
   }
 
   return { text: text.trim(), toolCalls: [] };
 }
 
-/**
- * Convert Anthropic message format into a clean prompt string for OpenCode CLI,
- * with full tool schemas injected so Claude Code controls tool execution.
- */
-function buildPrompt(body) {
-  let promptParts = [];
-  const allowedTools = [];
-
-  // 1. Tool names allowed
-  if (Array.isArray(body.tools) && body.tools.length > 0) {
-    for (const tool of body.tools) {
-      if (tool && tool.name) allowedTools.push(tool.name);
-    }
-  }
-
-  // 2. Add system prompt from Claude Code
-  if (body.system) {
-    let sysText = '';
-    if (typeof body.system === 'string') {
-      sysText = body.system;
-    } else if (Array.isArray(body.system)) {
-      sysText = body.system.map(s => (typeof s === 'string' ? s : (s.text || ''))).join('\n');
-    }
-    if (sysText.trim()) {
-      promptParts.push(`[Claude Code Instructions]\n${sysText.trim()}\n`);
-    }
-  }
-
-  // 3. Add message history
-  if (Array.isArray(body.messages)) {
-    for (const msg of body.messages) {
-      const role = msg.role === 'assistant' ? 'Assistant' : 'User';
-
-      if (typeof msg.content === 'string') {
-        promptParts.push(`${role}: ${msg.content.trim()}`);
-      } else if (Array.isArray(msg.content)) {
-        let textParts = [];
-        for (const part of msg.content) {
-          if (part.type === 'text' && part.text) {
-            textParts.push(part.text);
-          } else if (part.type === 'tool_use') {
-            textParts.push(`\`\`\`tool_call\n${JSON.stringify({ name: part.name, input: part.input })}\n\`\`\``);
-          } else if (part.type === 'tool_result') {
-            const resContent = typeof part.content === 'string'
-              ? part.content
-              : (Array.isArray(part.content)
-                  ? part.content.map(c => c.text || JSON.stringify(c)).join('\n')
-                  : JSON.stringify(part.content || ''));
-            textParts.push(`[Tool Result for ${part.tool_use_id || 'tool'}]:\n${resContent}`);
-          }
-        }
-        if (textParts.length > 0) {
-          promptParts.push(`${role}: ${textParts.join('\n\n')}`);
-        }
-      }
-    }
-  }
-
-  promptParts.push('Assistant:');
-  return { prompt: promptParts.join('\n\n'), allowedTools };
-}
-
-/**
- * Recursively find a file with matching basename inside a directory (max depth 6)
- */
-function findFileInDir(dir, basename, depth = 0) {
-  if (depth > 6 || !dir || !fs.existsSync(dir)) return null;
-  try {
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const e of entries) {
-      if (e.name === 'node_modules' || e.name === '.git' || e.name === 'dist' || e.name === 'build' || e.name === '.claude') continue;
-      const full = path.join(dir, e.name);
-      if (e.isFile() && e.name === basename) return full;
-      if (e.isDirectory()) {
-        const sub = findFileInDir(full, basename, depth + 1);
-        if (sub) return sub;
-      }
-    }
-  } catch (_) {}
-  return null;
-}
-
-/**
- * Detect the user's project directory from headers, system prompt, or message history.
- */
-function detectProjectDir(body, req) {
-  const hdr = req.headers['x-opencode-directory'] || req.headers['x-project-directory'];
-  if (hdr && fs.existsSync(hdr)) return hdr;
-
-  let sysText = '';
-  if (typeof body.system === 'string') {
-    sysText = body.system;
-  } else if (Array.isArray(body.system)) {
-    sysText = body.system.map(s => (typeof s === 'string' ? s : (s.text || ''))).join('\n');
-  }
-
-  if (sysText) {
-    const m = sysText.match(/(?:current working directory is|working directory is|working directory:|cwd is|cwd:)\s*(\/[A-Za-z0-9_./-]+)/i);
-    if (m) {
-      const p = m[1].replace(/[.,:;)]+$/, '').trim();
-      if (fs.existsSync(p)) return p;
-    }
-    const mTag = sysText.match(/<(?:cwd|working_dir|project_root|project_dir)>([^<]+)<\//i);
-    if (mTag) {
-      const p = mTag[1].replace(/[.,:;)]+$/, '').trim();
-      if (fs.existsSync(p)) return p;
-    }
-  }
-
-  if (Array.isArray(body.messages)) {
-    for (let i = body.messages.length - 1; i >= 0; i--) {
-      const msg = body.messages[i];
-      const str = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
-      const matches = str.match(/\/home\/[a-zA-Z0-9_.-]+(?:\/[a-zA-Z0-9_.-]+)+/g);
-      if (matches) {
-        for (const candidate of matches) {
-          try {
-            let cur = candidate;
-            while (cur && cur !== '/' && cur !== '/home/alan') {
-              if (fs.existsSync(path.join(cur, 'package.json')) || fs.existsSync(path.join(cur, '.git')) || fs.existsSync(path.join(cur, 'go.mod'))) {
-                return cur;
-              }
-              cur = path.dirname(cur);
-            }
-          } catch (_) {}
-        }
-      }
-    }
-  }
-
-  return process.env.CLAUDE_DIR || process.cwd();
-}
-
-/**
- * Map an OpenCode-native tool name + input to the Claude Code equivalent.
- */
-function mapOpenCodeTool(toolName, input, allowedTools, projectDir) {
-  const norm = (toolName || '').toLowerCase();
-
-  function cleanPath(p) {
-    if (!p) return '';
-    let res = p;
-    if (projectDir && res.startsWith(projectDir)) {
-      res = res.slice(projectDir.length).replace(/^\/+/, '');
-    }
-    const SANDBOX_DIR_PATH = path.join(os.tmpdir(), 'coc-bridge-sandbox');
-    if (res.startsWith(SANDBOX_DIR_PATH)) {
-      res = res.slice(SANDBOX_DIR_PATH.length).replace(/^\/+/, '');
-    }
-    // If relative path already exists in projectDir, use it
-    if (projectDir && fs.existsSync(path.join(projectDir, res))) {
-      return res;
-    }
-    // If res is just a filename/basename, search inside projectDir!
-    if (projectDir) {
-      const base = path.basename(res);
-      const found = findFileInDir(projectDir, base);
-      if (found) {
-        return path.relative(projectDir, found);
-      }
-    }
-    return res;
-  }
-
-  const findMatch = (...names) =>
-    (allowedTools && allowedTools.find(t => names.includes(t.toLowerCase()))) || null;
-
-  const find = (...names) =>
-    findMatch(...names) || names[0];
-
-  if (norm === 'read' || norm === 'view') {
-    const rawPath = input.path || input.file_path || input.filePath || '.';
-    const filePath = cleanPath(rawPath);
-    const readTool = findMatch('read', 'view', 'readfile');
-    if (readTool) {
-      return { name: readTool, input: { file_path: filePath } };
-    }
-    const bashTool = findMatch('bash', 'shell', 'terminal');
-    if (bashTool) {
-      return { name: bashTool, input: { command: `cat "${filePath}"` } };
-    }
-    return { name: 'read', input: { file_path: filePath } };
-  }
-  if (norm === 'shell' || norm === 'bash' || norm === 'command') {
-    const cmd = input.command || input.cmd || input.script || '';
-    return { name: find('bash', 'shell'), input: { command: cmd } };
-  }
-  if (norm === 'glob' || norm === 'list' || norm === 'ls') {
-    const pattern = input.pattern || input.glob || '*';
-    const rawPath = input.path || input.directory || input.dir || '.';
-    const searchDir = cleanPath(rawPath) || '.';
-    const globTool = findMatch('glob', 'globtool', 'list', 'ls');
-    if (globTool) {
-      return { name: globTool, input: { pattern, path: searchDir } };
-    }
-    const bashTool = findMatch('bash', 'shell', 'terminal');
-    if (bashTool) {
-      let findCmd;
-      if (!pattern || pattern === '*' || pattern === '**' || pattern === '**/*') {
-        findCmd = `find "${searchDir}" -maxdepth 3 -not -path '*/.*' 2>/dev/null | head -n 100`;
-      } else {
-        const cleanPat = pattern.replace(/^\*\*\//, '');
-        if (cleanPat.includes('/')) {
-          findCmd = `find "${searchDir}" -path "*${cleanPat}*" -not -path '*/.*' 2>/dev/null | head -n 100`;
-        } else {
-          findCmd = `find "${searchDir}" -name "${cleanPat}" -not -path '*/.*' 2>/dev/null | head -n 100`;
-        }
-      }
-      return { name: bashTool, input: { command: findCmd } };
-    }
-    return { name: 'glob', input: { pattern, path: searchDir } };
-  }
-  if (norm === 'grep' || norm === 'search' || norm === 'find_in_files') {
-    const pattern = input.pattern || input.query || input.regex || '';
-    const rawPath = input.path || input.directory || input.dir || '.';
-    const searchDir = cleanPath(rawPath) || '.';
-    const grepTool = findMatch('grep', 'greptool', 'search');
-    if (grepTool) {
-      return { name: grepTool, input: { pattern, path: searchDir } };
-    }
-    const bashTool = findMatch('bash', 'shell', 'terminal');
-    if (bashTool) {
-      const escaped = (pattern || '').replace(/(["\\$`])/g, '\\$1');
-      return {
-        name: bashTool,
-        input: {
-          command: `grep -rn --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules "${escaped}" "${searchDir}" 2>/dev/null | head -n 100`
-        }
-      };
-    }
-    return { name: 'grep', input: { pattern, path: searchDir } };
-  }
-  if (norm === 'edit' || norm === 'str_replace') {
-    const rawPath = input.path || input.file_path || input.filePath || '';
-    const oldStr = input.oldString !== undefined ? input.oldString :
-                  (input.old_string !== undefined ? input.old_string :
-                  (input.original !== undefined ? input.original :
-                  (input.oldText !== undefined ? input.oldText : '')));
-    const newStr = input.newString !== undefined ? input.newString :
-                  (input.new_string !== undefined ? input.new_string :
-                  (input.replacement !== undefined ? input.replacement :
-                  (input.newText !== undefined ? input.newText : '')));
-    const replaceAll = input.replaceAll !== undefined ? input.replaceAll :
-                      (input.replace_all !== undefined ? input.replace_all : false);
-
-    return {
-      name: find('edit', 'str_replace_based_edit_tool'),
-      input: {
-        file_path: cleanPath(rawPath),
-        old_string: oldStr,
-        new_string: newStr,
-        replace_all: replaceAll
-      }
-    };
-  }
-  if (norm === 'write' || norm === 'create') {
-    const rawPath = input.path || input.file_path || input.filePath || '';
-    const content = input.content !== undefined ? input.content :
-                   (input.file_text !== undefined ? input.file_text :
-                   (input.text !== undefined ? input.text : ''));
-    return { name: find('write', 'create'), input: { file_path: cleanPath(rawPath), content } };
-  }
-  if (norm === 'patch' || norm === 'multiedit') {
-    return { name: find('multiedit', 'patch'), input };
-  }
-  return { name: toolName, input };
-}
-
-/**
- * Handle POST /v1/messages (Anthropic API compatible)
- */
-function handleMessagesRequest(req, res, reqBody) {
+// ─── POST /v1/messages ───────────────────────────────────────────────────────
+function handleMessagesRequest(req, res, rawBody) {
   let body;
-  try {
-    body = JSON.parse(reqBody);
-  } catch (err) {
+  try { body = JSON.parse(rawBody); }
+  catch (_) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Invalid JSON body' } }));
-    return;
+    return res.end(JSON.stringify({ error: { type: 'invalid_request_error', message: 'Invalid JSON body' } }));
   }
 
-  const modelName = resolveModel(body.model);
-  const { prompt, allowedTools } = buildPrompt(body);
-  const isStreaming = Boolean(body.stream);
-  const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
+  const modelStr     = resolveModel(body.model);
+  const isStreaming  = Boolean(body.stream);
+  const messageId    = `msg_${crypto.randomBytes(12).toString('hex')}`;
+  const allowedTools = Array.isArray(body.tools) ? body.tools.map(t => t.name).filter(Boolean) : [];
 
-  // ── Determine working directory ──────────────────────────────────────────────
-  const projectDir = detectProjectDir(body, req);
+  console.log(`[Bridge] Request: ${modelStr} (tools: ${allowedTools.length}, streaming=${isStreaming})`);
+  if (allowedTools.length) console.log(`[Bridge] Tools from Claude Code: ${allowedTools.join(', ')}`);
 
-  console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming}, dir=${projectDir})`);
-  console.log(`[Bridge] Tools from client: ${allowedTools.join(', ')}`);
+  const prompt = buildPrompt(body);
 
-  // ── Spawn opencode ────────────────────────────────────────────────────────────
-  // --standalone: own private server, no port conflict with background opencode.
-  const childArgs = ['run', '-m', modelName, '--format', 'json', '--thinking'];
-  // Note: --standalone may not be supported by all opencode versions; try without if it fails
-  const binDir = path.dirname(OPENCODE_BIN);
-  const childEnv = {
-    ...process.env,
-    PATH: binDir + (process.env.PATH ? path.delimiter + process.env.PATH : '')
-  };
-  const child = spawn(OPENCODE_BIN, childArgs, {
-    cwd: projectDir,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: childEnv
-  });
-
-  // Request timeout safety (default 5 minutes)
-  const timeoutMs = parseInt(process.env.BRIDGE_TIMEOUT_MS || '300000', 10);
-  const timer = setTimeout(() => {
-    if (!child.killed) {
-      console.warn(`[Bridge] Request timed out after ${timeoutMs}ms, terminating child process`);
-      child.kill('SIGTERM');
+  // ── Run opencode api session.generate (pure LLM, no agent) ────────────────
+  let sessionID;
+  try {
+    sessionID = getOrCreateSession(modelStr);
+  } catch (err) {
+    console.error('[Bridge] Session error:', err.message);
+    if (isStreaming) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+      res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: err.message } })}\n\n`);
+      return res.end();
     }
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ error: { type: 'api_error', message: err.message } }));
+  }
+
+  // Spawn opencode api session.generate asynchronously
+  const { spawnSync: _s, ...cp } = require('child_process');
+  const { spawn } = cp;
+
+  const env = { ...process.env, PATH: OPENCODE_BIN_DIR + path.delimiter + process.env.PATH };
+  const child = spawn(OPENCODE_BIN, [
+    'api', 'session.generate',
+    '--param', `sessionID=${sessionID}`,
+    '-d', JSON.stringify({ prompt })
+  ], { stdio: ['ignore', 'pipe', 'pipe'], env });
+
+  const timeoutMs = parseInt(process.env.BRIDGE_TIMEOUT_MS || '300000', 10);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    if (!child.killed) child.kill('SIGTERM');
   }, timeoutMs);
 
-  // ── SSE state ─────────────────────────────────────────────────────────────────
-  let sseStarted = false;
-  let blockIndex = 0;
-  let thinkingBlockIndex = -1;
-  let thinkingClosed = false;
-  let textBlockIndex = -1;
-  let inputTokens = Math.ceil(prompt.length / 4);
-  let outputTokens = 0;
-  let accumulatedThinking = '';
-  let accumulatedText = '';
-  let reportedTokens = null;
+  let stdoutBuf = '';
+  let stderrBuf = '';
   let clientClosed = false;
-  let nativeToolsEmitted = 0; // count of tool_use events from OpenCode
-  const nativeToolCalls = [];
 
-  function startSSE() {
-    if (sseStarted || !isStreaming) return;
-    sseStarted = true;
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive'
-    });
-    res.write(`event: message_start\ndata: ${JSON.stringify({
-      type: 'message_start',
-      message: {
-        id: messageId,
-        type: 'message',
-        role: 'assistant',
-        model: modelName,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: 1 }
-      }
-    })}\n\n`);
-  }
-
-  function sseWrite(event, data) {
-    if (clientClosed) return;
-    try { res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`); } catch (_) {}
-  }
-
-  function emitThinking(chunk) {
-    if (!chunk || !isStreaming) return;
-    startSSE();
-    if (thinkingBlockIndex === -1) {
-      thinkingBlockIndex = blockIndex++;
-      sseWrite('content_block_start', {
-        type: 'content_block_start',
-        index: thinkingBlockIndex,
-        content_block: { type: 'thinking', thinking: '' }
-      });
-    }
-    sseWrite('content_block_delta', {
-      type: 'content_block_delta',
-      index: thinkingBlockIndex,
-      delta: { type: 'thinking_delta', thinking: chunk }
-    });
-  }
-
-  function closeThinking() {
-    if (thinkingBlockIndex !== -1 && !thinkingClosed) {
-      thinkingClosed = true;
-      sseWrite('content_block_stop', { type: 'content_block_stop', index: thinkingBlockIndex });
-    }
-  }
-
-  function emitToolUse(toolName, toolInput) {
-    const mapped = mapOpenCodeTool(toolName, toolInput || {}, allowedTools, projectDir);
-
-    // Only emit if the tool is in Claude Code's allowed list
-    const lcAllowed = allowedTools.map(t => t.toLowerCase());
-    if (allowedTools.length > 0 && !lcAllowed.includes(mapped.name.toLowerCase())) {
-      console.log(`[Bridge] Skipping tool not in allowed list: ${toolName} → ${mapped.name}`);
-      return;
-    }
-
-    const toolUseId = `toolu_${crypto.randomBytes(12).toString('hex')}`;
-    console.log(`[Bridge] ToolUse emit: ${toolName} → ${mapped.name}`);
-    nativeToolsEmitted++;
-
-    if (!isStreaming) {
-      nativeToolCalls.push({ id: toolUseId, name: mapped.name, input: mapped.input });
-      return;
-    }
-
-    closeThinking();
-    startSSE();
-
-    sseWrite('content_block_start', {
-      type: 'content_block_start', index: blockIndex,
-      content_block: { type: 'tool_use', id: toolUseId, name: mapped.name, input: {} }
-    });
-    sseWrite('content_block_delta', {
-      type: 'content_block_delta', index: blockIndex,
-      delta: { type: 'input_json_delta', partial_json: JSON.stringify(mapped.input) }
-    });
-    sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-    blockIndex++;
-  }
-
-  function emitText(text) {
-    if (!text || !text.trim() || !isStreaming) return;
-    closeThinking();
-    startSSE();
-    sseWrite('content_block_start', {
-      type: 'content_block_start', index: blockIndex,
-      content_block: { type: 'text', text: '' }
-    });
-    sseWrite('content_block_delta', {
-      type: 'content_block_delta', index: blockIndex,
-      delta: { type: 'text_delta', text: text }
-    });
-    sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
-    blockIndex++;
-  }
-
-  // ── Clean up if client disconnects ───────────────────────────────────────────
   res.on('close', () => {
     clientClosed = true;
     clearTimeout(timer);
     if (!child.killed) child.kill('SIGTERM');
   });
 
-  child.stdin.write(prompt);
-  child.stdin.end();
-
-  let stdoutBuffer = '';
-  let accumulatedError = '';
-  const pendingTools = new Map(); // toolId → { toolName, input }
-
-  child.stdout.on('data', chunk => {
-    stdoutBuffer += chunk.toString();
-    const lines = stdoutBuffer.split('\n');
-    stdoutBuffer = lines.pop();
-
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      let ev;
-      try { ev = JSON.parse(line); } catch (_) { continue; }
-
-      // ── Model thinking / reasoning ───────────────────────────────────────
-      if (ev.type === 'reasoning' && ev.part && typeof ev.part.text === 'string') {
-        accumulatedThinking += ev.part.text;
-        emitThinking(ev.part.text);
-      }
-
-      // ── OpenCode native tool events ──────────────────────────────────────
-      if (ev.type === 'tool_use' && ev.part) {
-        closeThinking();
-        const part      = ev.part;
-        const toolName  = part.tool || part.name || '';
-        const toolState = part.state || {};
-        const toolId    = part.id || part.tool_use_id || `${toolName}_${Date.now()}`;
-
-        const status = toolState.status || '';
-        if (status === 'running' || status === 'pending') {
-          // Tool started — remember, emit on completion (so we have full input)
-          pendingTools.set(toolId, { toolName, input: toolState.input || {} });
-        } else if (status === 'completed' || status === 'error') {
-          const input = toolState.input || (pendingTools.get(toolId) || {}).input || {};
-          pendingTools.delete(toolId);
-          emitToolUse(toolName, input);
-        } else {
-          // No explicit status — emit immediately
-          emitToolUse(toolName, toolState.input || {});
-        }
-      }
-
-      // ── Model text ───────────────────────────────────────────────────────
-      if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
-        closeThinking();
-        accumulatedText += ev.part.text;
-        if (isStreaming && allowedTools.length === 0) {
-          if (!sseStarted) startSSE();
-          if (textBlockIndex === -1) {
-            textBlockIndex = blockIndex++;
-            sseWrite('content_block_start', {
-              type: 'content_block_start',
-              index: textBlockIndex,
-              content_block: { type: 'text', text: '' }
-            });
-          }
-          sseWrite('content_block_delta', {
-            type: 'content_block_delta',
-            index: textBlockIndex,
-            delta: { type: 'text_delta', text: ev.part.text }
-          });
-        }
-      }
-
-      // ── Token counts ─────────────────────────────────────────────────────
-      if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
-        reportedTokens = ev.part.tokens;
-      }
-    }
-  });
-
-  child.stderr.on('data', chunk => {
-    accumulatedError += chunk.toString();
-  });
+  child.stdout.on('data', d => { stdoutBuf += d.toString(); });
+  child.stderr.on('data', d => { stderrBuf += d.toString(); });
 
   child.on('close', code => {
     clearTimeout(timer);
     if (clientClosed) return;
 
-    // Flush any remaining buffered line
-    if (stdoutBuffer.trim()) {
-      try {
-        const ev = JSON.parse(stdoutBuffer);
-        if (ev.type === 'reasoning' && ev.part && typeof ev.part.text === 'string') {
-          accumulatedThinking += ev.part.text;
-          emitThinking(ev.part.text);
-        } else if (ev.type === 'text' && ev.part && typeof ev.part.text === 'string') {
-          closeThinking();
-          accumulatedText += ev.part.text;
-        } else if (ev.type === 'step_finish' && ev.part && ev.part.tokens) {
-          reportedTokens = ev.part.tokens;
-        } else if (ev.type === 'tool_use' && ev.part) {
-          closeThinking();
-          const part = ev.part;
-          const toolState = part.state || {};
-          emitToolUse(part.tool || '', toolState.input || {});
+    // Parse the response
+    let text = '';
+    let parseError = null;
+    try {
+      const parsed = JSON.parse(stdoutBuf.trim());
+      if (parsed.data && typeof parsed.data.text === 'string') {
+        text = parsed.data.text;
+      } else if (parsed._tag || parsed.message) {
+        // opencode returned an error
+        const msg = parsed.message || JSON.stringify(parsed);
+        parseError = msg;
+
+        // If session was invalidated (session not found), clear it from pool
+        if (msg.includes('not found') || msg.includes('SessionNotFound')) {
+          sessionPool.delete(modelStr);
+          console.warn(`[Bridge] Session ${sessionID} invalidated, will recreate on next request`);
         }
-      } catch (_) {}
-    }
-
-    closeThinking();
-
-    // Error: process failed, nothing useful
-    if (code !== 0 && !accumulatedText.trim() && nativeToolsEmitted === 0) {
-      console.error(`[Bridge] OpenCode exited with code ${code}: ${accumulatedError}`);
-      const errMsg = accumulatedError.trim() || `OpenCode process exited with code ${code}`;
-      if (isStreaming) {
-        if (!sseStarted) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
-        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: errMsg } })}\n\n`);
-        res.end();
       } else {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: { type: 'api_error', message: errMsg } }));
+        text = stdoutBuf.trim();
       }
-      return;
+    } catch (_) {
+      parseError = `Failed to parse opencode response: ${stdoutBuf.slice(0, 200)}`;
+      if (stderrBuf) parseError += `\nStderr: ${stderrBuf.slice(0, 200)}`;
     }
 
-    // Token accounting
-    inputTokens  = (reportedTokens && reportedTokens.input)  || Math.ceil(prompt.length / 4);
-    outputTokens = (reportedTokens && reportedTokens.output)
-      ? (reportedTokens.output + (reportedTokens.reasoning || 0))
-      : Math.ceil((accumulatedText.length + accumulatedThinking.length) / 4);
+    if (parseError && !text) {
+      console.error(`[Bridge] Error from opencode: ${parseError}`);
+      if (isStreaming) {
+        if (!res.headersSent) res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+        res.write(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { message: parseError } })}\n\n`);
+        return res.end();
+      }
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ error: { type: 'api_error', message: parseError } }));
+    }
+
+    if (!text) text = 'Done.';
+
+    // Check if text contains embedded tool calls
+    const { text: cleanText, toolCalls } = extractToolCalls(text, allowedTools);
+    const inputTokens  = Math.ceil(prompt.length / 4);
+    const outputTokens = Math.max(1, Math.ceil(text.length / 4));
 
     if (isStreaming) {
-      let hasToolCalls = nativeToolsEmitted > 0;
-      // If no native tool events came from OpenCode, try text-based tool_call fallback
-      if (nativeToolsEmitted === 0) {
-        const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
-        if (textToolCalls.length > 0) {
-          hasToolCalls = true;
-          if (cleanText.length > 0) emitText(cleanText);
-          for (const tc of textToolCalls) emitToolUse(tc.name, tc.input);
-        } else {
-          // If text wasn't already streamed in real-time, emit it now
-          if (textBlockIndex === -1) {
-            let finalContent = (cleanText || accumulatedText || '').trim();
-            // CRITICAL GUARD: Anthropic SDK rejects empty responses or responses containing ONLY thinking blocks!
-            if (!finalContent) {
-              finalContent = accumulatedThinking.trim()
-                ? "I've analyzed the request."
-                : "Done.";
-            }
-            emitText(finalContent);
-          } else {
-            sseWrite('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
-          }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+
+      const sseWrite = (event, data) => {
+        if (!clientClosed) res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+
+      sseWrite('message_start', {
+        type: 'message_start',
+        message: {
+          id: messageId, type: 'message', role: 'assistant', model: modelStr,
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: { input_tokens: inputTokens, output_tokens: 1 }
         }
-      } else {
-        hasToolCalls = true;
-        // Native tool_use blocks were already emitted during the stream.
-        if (textBlockIndex !== -1) {
-          sseWrite('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
-        }
+      });
+
+      let blockIndex = 0;
+      const hasToolCalls = toolCalls.length > 0;
+
+      // Emit text if present
+      const textToEmit = (cleanText || (!hasToolCalls ? text : '')).trim();
+      if (textToEmit) {
+        sseWrite('content_block_start', {
+          type: 'content_block_start', index: blockIndex,
+          content_block: { type: 'text', text: '' }
+        });
+        sseWrite('content_block_delta', {
+          type: 'content_block_delta', index: blockIndex,
+          delta: { type: 'text_delta', text: textToEmit }
+        });
+        sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        blockIndex++;
       }
 
-      if (!sseStarted) startSSE();
+      // Emit tool_use blocks
+      for (const tc of toolCalls) {
+        const toolUseId = `toulu_${crypto.randomBytes(12).toString('hex')}`;
+        sseWrite('content_block_start', {
+          type: 'content_block_start', index: blockIndex,
+          content_block: { type: 'tool_use', id: toolUseId, name: tc.name, input: {} }
+        });
+        sseWrite('content_block_delta', {
+          type: 'content_block_delta', index: blockIndex,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify(tc.input) }
+        });
+        sseWrite('content_block_stop', { type: 'content_block_stop', index: blockIndex });
+        blockIndex++;
+      }
 
-      // Final safety guard: ensure at least one content block exists
+      // Guard: at least one content block must exist
       if (blockIndex === 0) {
-        emitText("Done.");
+        sseWrite('content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } });
+        sseWrite('content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done.' } });
+        sseWrite('content_block_stop', { type: 'content_block_stop', index: 0 });
       }
 
-      const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
       sseWrite('message_delta', {
         type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: Math.max(outputTokens, 1) }
+        delta: { stop_reason: hasToolCalls ? 'tool_use' : 'end_turn', stop_sequence: null },
+        usage: { output_tokens: outputTokens }
       });
       sseWrite('message_stop', { type: 'message_stop' });
       res.end();
 
     } else {
-      // Non-streaming response
-      const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
+      // Non-streaming
       const content = [];
-      if (accumulatedThinking.trim()) {
-        content.push({ type: 'thinking', thinking: accumulatedThinking.trim() });
-      }
-      if (cleanText.length > 0) content.push({ type: 'text', text: cleanText });
-      for (const tc of textToolCalls) {
+      const textToInclude = (cleanText || (!toolCalls.length ? text : '')).trim();
+      if (textToInclude) content.push({ type: 'text', text: textToInclude });
+      for (const tc of toolCalls) {
         content.push({
           type: 'tool_use',
           id: `toolu_${crypto.randomBytes(12).toString('hex')}`,
-          name: tc.name,
-          input: tc.input
+          name: tc.name, input: tc.input
         });
       }
-      for (const tc of nativeToolCalls) {
-        content.push({
-          type: 'tool_use',
-          id: tc.id,
-          name: tc.name,
-          input: tc.input
-        });
-      }
-      if (!content.some(c => c.type === 'text' || c.type === 'tool_use')) {
-        content.push({
-          type: 'text',
-          text: accumulatedText.trim() || (accumulatedThinking.trim() ? "I've analyzed the request." : "Done.")
-        });
-      }
+      if (content.length === 0) content.push({ type: 'text', text: text.trim() || 'Done.' });
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        id: messageId, type: 'message', role: 'assistant', model: modelName, content,
+        id: messageId, type: 'message', role: 'assistant', model: modelStr, content,
         stop_reason: content.some(c => c.type === 'tool_use') ? 'tool_use' : 'end_turn',
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: Math.max(outputTokens, 1) }
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
       }));
     }
   });
 }
-// HTTP Server
+
+// ─── HTTP Server ──────────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
-  // CORS Headers
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
 
   const url = req.url.split('?')[0];
 
-  // Health check
+  // Health
   if (req.method === 'GET' && (url === '/' || url === '/health' || url === '/api/health')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    return res.end(JSON.stringify({
       status: 'ok',
-      service: 'opencode-claude-bridge',
+      version: require('../package.json').version,
       defaultModel: DEFAULT_MODEL,
       availableModels: OPENCODE_MODELS.map(m => m.id),
-      opencodeBinary: OPENCODE_BIN
+      backend: 'opencode-session-generate',
+      description: 'Pure LLM inference — Claude Code handles all tools'
     }));
-    return;
   }
 
-  // Model discovery endpoint for Claude Code (/v1/models)
-  if (req.method === 'GET' && (url === '/v1/models' || url === '/api/v1/models' || url === '/models')) {
+  // Models list (OpenAI-compat)
+  if (req.method === 'GET' && (url === '/v1/models' || url === '/api/v1/models')) {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
+    return res.end(JSON.stringify({
+      object: 'list',
       data: OPENCODE_MODELS.map(m => ({
-        id: m.id,
-        display_name: m.display_name,
-        type: 'model',
-        created_at: 1728864000
+        id: m.id, object: 'model', created: 1700000000, owned_by: 'opencode',
+        display_name: m.display_name
       }))
     }));
-    return;
   }
 
-  // Handle Anthropic /v1/messages or /api/v1/messages
+  // Messages
   if (req.method === 'POST' && (url === '/v1/messages' || url === '/api/v1/messages')) {
     const chunks = [];
     let receivedBytes = 0;
-
     req.on('data', chunk => {
       receivedBytes += chunk.length;
       if (receivedBytes > MAX_PAYLOAD_BYTES) {
@@ -944,16 +515,14 @@ const server = http.createServer((req, res) => {
       }
       chunks.push(chunk);
     });
-
     req.on('end', () => {
       if (receivedBytes > MAX_PAYLOAD_BYTES) return;
-      const rawBody = Buffer.concat(chunks).toString('utf8');
-      handleMessagesRequest(req, res, rawBody);
+      handleMessagesRequest(req, res, Buffer.concat(chunks).toString('utf8'));
     });
     return;
   }
 
-  // Fallback 404
+  // 404
   res.writeHead(404, { 'Content-Type': 'application/json' });
   res.end(JSON.stringify({ error: { message: `Route ${req.method} ${url} not found` } }));
 });
@@ -961,20 +530,13 @@ const server = http.createServer((req, res) => {
 if (require.main === module) {
   server.listen(PORT, '127.0.0.1', () => {
     console.log(`=======================================================`);
-    console.log(` [OpenCode-Claude Bridge] listening on http://127.0.0.1:${PORT}`);
+    console.log(` [OpenCode-Claude Bridge] v1.1.0`);
+    console.log(` Listening on http://127.0.0.1:${PORT}`);
     console.log(` Default model: ${DEFAULT_MODEL}`);
-    console.log(` Model discovery: http://127.0.0.1:${PORT}/v1/models`);
-    console.log(` Compatible endpoint: http://127.0.0.1:${PORT}/v1/messages`);
+    console.log(` Backend: opencode session.generate (pure LLM, no agent)`);
+    console.log(` Claude Code handles all file reads/edits/bash commands`);
     console.log(`=======================================================`);
   });
 }
 
-module.exports = {
-  server,
-  mapOpenCodeTool,
-  extractToolCalls,
-  buildPrompt,
-  detectProjectDir,
-  findFileInDir,
-  resolveModel
-};
+module.exports = { server, buildPrompt, extractToolCalls, resolveModel, parseModel };
