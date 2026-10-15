@@ -115,6 +115,8 @@ export ANTHROPIC_DEFAULT_FABLE_MODEL_NAME="Ling 3.1 Flash"
 
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1
+export CLAUDE_CODE_AUTO_MODE_SERVER=0
+export CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS=1
 
 exec "${claudeBinReal}" "\$@"
 `;
@@ -164,6 +166,8 @@ for (const settingsPath of vsCodeCandidates) {
         { name: 'ANTHROPIC_API_KEY', value: '' },
         { name: 'CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT', value: '1' },
         { name: 'CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY', value: '1' },
+        { name: 'CLAUDE_CODE_AUTO_MODE_SERVER', value: '0' },
+        { name: 'CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS', value: '1' },
         { name: 'ANTHROPIC_MODEL', value: 'opencode/space-bunny-free' },
         { name: 'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME', value: 'Space Bunny' },
         { name: 'ANTHROPIC_DEFAULT_OPUS_MODEL', value: 'opencode/nemotron-3-ultra-free' },
