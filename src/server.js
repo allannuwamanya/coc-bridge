@@ -395,26 +395,73 @@ function mapOpenCodeTool(toolName, input, allowedTools, projectDir) {
     return res;
   }
 
+  const findMatch = (...names) =>
+    (allowedTools && allowedTools.find(t => names.includes(t.toLowerCase()))) || null;
+
   const find = (...names) =>
-    (allowedTools && allowedTools.find(t => names.includes(t.toLowerCase()))) || names[0];
+    findMatch(...names) || names[0];
 
   if (norm === 'read' || norm === 'view') {
     const rawPath = input.path || input.file_path || input.filePath || '.';
-    return { name: find('read', 'view'), input: { file_path: cleanPath(rawPath) } };
+    const filePath = cleanPath(rawPath);
+    const readTool = findMatch('read', 'view', 'readfile');
+    if (readTool) {
+      return { name: readTool, input: { file_path: filePath } };
+    }
+    const bashTool = findMatch('bash', 'shell', 'terminal');
+    if (bashTool) {
+      return { name: bashTool, input: { command: `cat "${filePath}"` } };
+    }
+    return { name: 'read', input: { file_path: filePath } };
   }
   if (norm === 'shell' || norm === 'bash' || norm === 'command') {
     const cmd = input.command || input.cmd || input.script || '';
     return { name: find('bash', 'shell'), input: { command: cmd } };
   }
-  if (norm === 'glob' || norm === 'list') {
+  if (norm === 'glob' || norm === 'list' || norm === 'ls') {
     const pattern = input.pattern || input.glob || '*';
     const rawPath = input.path || input.directory || input.dir || '.';
-    return { name: find('glob'), input: { pattern, path: cleanPath(rawPath) } };
+    const searchDir = cleanPath(rawPath) || '.';
+    const globTool = findMatch('glob', 'globtool', 'list', 'ls');
+    if (globTool) {
+      return { name: globTool, input: { pattern, path: searchDir } };
+    }
+    const bashTool = findMatch('bash', 'shell', 'terminal');
+    if (bashTool) {
+      let findCmd;
+      if (!pattern || pattern === '*' || pattern === '**' || pattern === '**/*') {
+        findCmd = `find "${searchDir}" -maxdepth 3 -not -path '*/.*' 2>/dev/null | head -n 100`;
+      } else {
+        const cleanPat = pattern.replace(/^\*\*\//, '');
+        if (cleanPat.includes('/')) {
+          findCmd = `find "${searchDir}" -path "*${cleanPat}*" -not -path '*/.*' 2>/dev/null | head -n 100`;
+        } else {
+          findCmd = `find "${searchDir}" -name "${cleanPat}" -not -path '*/.*' 2>/dev/null | head -n 100`;
+        }
+      }
+      return { name: bashTool, input: { command: findCmd } };
+    }
+    return { name: 'glob', input: { pattern, path: searchDir } };
   }
-  if (norm === 'grep' || norm === 'search') {
+  if (norm === 'grep' || norm === 'search' || norm === 'find_in_files') {
     const pattern = input.pattern || input.query || input.regex || '';
     const rawPath = input.path || input.directory || input.dir || '.';
-    return { name: find('grep'), input: { pattern, path: cleanPath(rawPath) } };
+    const searchDir = cleanPath(rawPath) || '.';
+    const grepTool = findMatch('grep', 'greptool', 'search');
+    if (grepTool) {
+      return { name: grepTool, input: { pattern, path: searchDir } };
+    }
+    const bashTool = findMatch('bash', 'shell', 'terminal');
+    if (bashTool) {
+      const escaped = (pattern || '').replace(/(["\\$`])/g, '\\$1');
+      return {
+        name: bashTool,
+        input: {
+          command: `grep -rn --exclude-dir=.git --exclude-dir=.claude --exclude-dir=node_modules "${escaped}" "${searchDir}" 2>/dev/null | head -n 100`
+        }
+      };
+    }
+    return { name: 'grep', input: { pattern, path: searchDir } };
   }
   if (norm === 'edit' || norm === 'str_replace') {
     const rawPath = input.path || input.file_path || input.filePath || '';
@@ -474,6 +521,7 @@ function handleMessagesRequest(req, res, reqBody) {
   const projectDir = detectProjectDir(body, req);
 
   console.log(`[Bridge] Request: ${modelName} (tools: ${allowedTools.length}, streaming=${isStreaming}, dir=${projectDir})`);
+  console.log(`[Bridge] Tools from client: ${allowedTools.join(', ')}`);
 
   // ── Spawn opencode ────────────────────────────────────────────────────────────
   // --standalone: own private server, no port conflict with background opencode.
@@ -512,6 +560,7 @@ function handleMessagesRequest(req, res, reqBody) {
   let reportedTokens = null;
   let clientClosed = false;
   let nativeToolsEmitted = 0; // count of tool_use events from OpenCode
+  const nativeToolCalls = [];
 
   function startSSE() {
     if (sseStarted || !isStreaming) return;
@@ -567,9 +616,6 @@ function handleMessagesRequest(req, res, reqBody) {
   }
 
   function emitToolUse(toolName, toolInput) {
-    if (!isStreaming) return;
-    closeThinking();
-    startSSE();
     const mapped = mapOpenCodeTool(toolName, toolInput || {}, allowedTools, projectDir);
 
     // Only emit if the tool is in Claude Code's allowed list
@@ -582,6 +628,14 @@ function handleMessagesRequest(req, res, reqBody) {
     const toolUseId = `toolu_${crypto.randomBytes(12).toString('hex')}`;
     console.log(`[Bridge] ToolUse emit: ${toolName} → ${mapped.name}`);
     nativeToolsEmitted++;
+
+    if (!isStreaming) {
+      nativeToolCalls.push({ id: toolUseId, name: mapped.name, input: mapped.input });
+      return;
+    }
+
+    closeThinking();
+    startSSE();
 
     sseWrite('content_block_start', {
       type: 'content_block_start', index: blockIndex,
@@ -742,10 +796,10 @@ function handleMessagesRequest(req, res, reqBody) {
     inputTokens  = (reportedTokens && reportedTokens.input)  || Math.ceil(prompt.length / 4);
     outputTokens = (reportedTokens && reportedTokens.output)
       ? (reportedTokens.output + (reportedTokens.reasoning || 0))
-      : Math.ceil(accumulatedText.length / 4);
+      : Math.ceil((accumulatedText.length + accumulatedThinking.length) / 4);
 
     if (isStreaming) {
-      let hasToolCalls = false;
+      let hasToolCalls = nativeToolsEmitted > 0;
       // If no native tool events came from OpenCode, try text-based tool_call fallback
       if (nativeToolsEmitted === 0) {
         const { text: cleanText, toolCalls: textToolCalls } = extractToolCalls(accumulatedText, allowedTools);
@@ -756,7 +810,14 @@ function handleMessagesRequest(req, res, reqBody) {
         } else {
           // If text wasn't already streamed in real-time, emit it now
           if (textBlockIndex === -1) {
-            emitText(accumulatedText);
+            let finalContent = (cleanText || accumulatedText || '').trim();
+            // CRITICAL GUARD: Anthropic SDK rejects empty responses or responses containing ONLY thinking blocks!
+            if (!finalContent) {
+              finalContent = accumulatedThinking.trim()
+                ? "I've analyzed the request."
+                : "Done.";
+            }
+            emitText(finalContent);
           } else {
             sseWrite('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
           }
@@ -764,17 +825,23 @@ function handleMessagesRequest(req, res, reqBody) {
       } else {
         hasToolCalls = true;
         // Native tool_use blocks were already emitted during the stream.
-        // We do not emit trailing text here because stop_reason is 'tool_use'
-        // and Claude Code will execute the tool and request the final answer in Turn 2.
+        if (textBlockIndex !== -1) {
+          sseWrite('content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+        }
       }
 
       if (!sseStarted) startSSE();
+
+      // Final safety guard: ensure at least one content block exists
+      if (blockIndex === 0) {
+        emitText("Done.");
+      }
 
       const stopReason = hasToolCalls ? 'tool_use' : 'end_turn';
       sseWrite('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: outputTokens }
+        usage: { output_tokens: Math.max(outputTokens, 1) }
       });
       sseWrite('message_stop', { type: 'message_stop' });
       res.end();
@@ -795,14 +862,27 @@ function handleMessagesRequest(req, res, reqBody) {
           input: tc.input
         });
       }
-      if (content.length === 0) content.push({ type: 'text', text: accumulatedText.trim() });
+      for (const tc of nativeToolCalls) {
+        content.push({
+          type: 'tool_use',
+          id: tc.id,
+          name: tc.name,
+          input: tc.input
+        });
+      }
+      if (!content.some(c => c.type === 'text' || c.type === 'tool_use')) {
+        content.push({
+          type: 'text',
+          text: accumulatedText.trim() || (accumulatedThinking.trim() ? "I've analyzed the request." : "Done.")
+        });
+      }
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         id: messageId, type: 'message', role: 'assistant', model: modelName, content,
         stop_reason: content.some(c => c.type === 'tool_use') ? 'tool_use' : 'end_turn',
         stop_sequence: null,
-        usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+        usage: { input_tokens: inputTokens, output_tokens: Math.max(outputTokens, 1) }
       }));
     }
   });
@@ -878,11 +958,23 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: { message: `Route ${req.method} ${url} not found` } }));
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`=======================================================`);
-  console.log(` [OpenCode-Claude Bridge] listening on http://127.0.0.1:${PORT}`);
-  console.log(` Default model: ${DEFAULT_MODEL}`);
-  console.log(` Model discovery: http://127.0.0.1:${PORT}/v1/models`);
-  console.log(` Compatible endpoint: http://127.0.0.1:${PORT}/v1/messages`);
-  console.log(`=======================================================`);
-});
+if (require.main === module) {
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`=======================================================`);
+    console.log(` [OpenCode-Claude Bridge] listening on http://127.0.0.1:${PORT}`);
+    console.log(` Default model: ${DEFAULT_MODEL}`);
+    console.log(` Model discovery: http://127.0.0.1:${PORT}/v1/models`);
+    console.log(` Compatible endpoint: http://127.0.0.1:${PORT}/v1/messages`);
+    console.log(`=======================================================`);
+  });
+}
+
+module.exports = {
+  server,
+  mapOpenCodeTool,
+  extractToolCalls,
+  buildPrompt,
+  detectProjectDir,
+  findFileInDir,
+  resolveModel
+};

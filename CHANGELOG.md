@@ -7,6 +7,14 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.7] — 2026-10-15
+
+### Fixed
+- **Bash Fallbacks for `Glob` and `Grep`**: When Claude Code connects without exposing `Glob` or `Grep` tools (exposing only `['Bash', 'Read', 'Edit', 'NotebookEdit', 'Write']`), OpenCode's `glob` and `grep` tool calls are now dynamically mapped to native `Bash` commands (`find` and `grep -rn` with automatic exclusion of hidden and vendor dirs) rather than being dropped.
+- **Empty Stream Guard ("Response stream was malformed")**: Fixed an issue where Anthropic SDK threw `API Error: The response stream was malformed` when an assistant response ended with only thinking blocks and zero text/tool blocks. The bridge now guarantees at least one valid text content block is emitted before `end_turn`.
+- **Non-Streaming Tool Use Collection**: Ensured native OpenCode tool invocations are properly captured and included in non-streaming Anthropic message responses.
+- **Enhanced Unit Test Suite**: Added standalone test coverage for tool mapping, path resolution, pattern normalization, and tool call extraction.
+
 ## [1.0.6] — 2026-10-15
 
 ### Fixed
