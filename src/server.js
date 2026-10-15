@@ -22,17 +22,30 @@ const DEFAULT_MODEL = process.env.OPENCODE_MODEL || config.defaultModel || 'open
 
 // ─── Find opencode binary ─────────────────────────────────────────────────────
 function findOpencodeBin() {
-  if (process.env.OPENCODE_BIN) return process.env.OPENCODE_BIN;
-  try { return execSync('which opencode', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim(); } catch (_) {}
+  if (process.env.OPENCODE_BIN) {
+    try { return fs.realpathSync(process.env.OPENCODE_BIN); } catch (_) { return process.env.OPENCODE_BIN; }
+  }
   const candidates = [
     path.join(os.homedir(), '.nvm', 'versions', 'node', 'v24.21.0', 'bin', 'opencode'),
     path.join(os.homedir(), '.nvm', 'versions', 'node', 'v22.0.0', 'bin', 'opencode'),
-    path.join(os.homedir(), '.local', 'bin', 'opencode'),
     '/usr/local/bin/opencode',
     '/usr/bin/opencode',
+    path.join(os.homedir(), '.local', 'bin', 'opencode'),
   ];
+  try {
+    const which = execSync('which opencode', { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
+    if (which && !candidates.includes(which)) candidates.unshift(which);
+  } catch (_) {}
+
   for (const c of candidates) {
-    try { fs.accessSync(c, fs.constants.X_OK); return c; } catch (_) {}
+    try {
+      fs.accessSync(c, fs.constants.X_OK);
+      const real = fs.realpathSync(c);
+      const binDir = path.dirname(real);
+      if (fs.existsSync(path.join(binDir, 'opencode-bin')) || fs.existsSync(real)) {
+        return real;
+      }
+    } catch (_) {}
   }
   console.error('[coc-bridge] ❌  Cannot find opencode binary.\n  Install it: npm install -g opencode\n  Or set: OPENCODE_BIN=/path/to/opencode');
   process.exit(1);

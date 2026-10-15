@@ -201,6 +201,19 @@ try {
     fs.symlinkSync(bridgeBin, targetLink);
     ok(`Linked coc-bridge to ${targetLink}`);
   }
+  // Also ensure opencode-bin is linked if opencode exists in localBin
+  const opencodeLink = path.join(localBin, 'opencode');
+  const opencodeBinLink = path.join(localBin, 'opencode-bin');
+  if (fs.existsSync(opencodeLink) && !fs.existsSync(opencodeBinLink)) {
+    try {
+      const real = fs.realpathSync(opencodeLink);
+      const realBin = path.join(path.dirname(real), 'opencode-bin');
+      if (fs.existsSync(realBin)) {
+        fs.symlinkSync(realBin, opencodeBinLink);
+        ok(`Linked opencode-bin to ${opencodeBinLink}`);
+      }
+    } catch (_) {}
+  }
 } catch (_) {}
 
 // ─────────────────────────────────────────────

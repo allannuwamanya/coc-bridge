@@ -7,6 +7,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [1.0.6] — 2026-10-15
+
+### Fixed
+- **Symlinked Binary Resolution (`opencode-bin` missing error)**: Resolved `fs.realpathSync` in binary discovery so that invoking `opencode` via symlinks (such as `~/.local/bin/opencode`) evaluates its relative path to the canonical NVM location where `opencode-bin` resides, fixing the `line 5: opencode-bin: No such file or directory` error after system restarts.
+- Automatically link `opencode-bin` into `~/.local/bin` during setup.
+
 ## [1.0.5] — 2026-10-15
 
 ### Added
